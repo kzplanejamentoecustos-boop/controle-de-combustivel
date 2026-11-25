@@ -6600,7 +6600,7 @@ function mostrarCarregamento(tipo, sub = '', { logo, rodape = '', titulo, etapas
 /* ===== app.js ===== */
 /* =============================================================================
    Controle de Óleo Diesel — app.js
-   Versao: 1.1.1 (login do Portal KZ, base da obra na nuvem KZ, Iniciar/Entrar pelo Portal)
+   Versao: 1.2.0 (tela unica; Vincular NF com valor total; Controlador no menu com aba Relatorios)
    Feito a partir do CTC App Base (CTC App Standard v1.8.0).
 
    FLUXO
@@ -7016,7 +7016,7 @@ async function entrarPeloPortal({ perfilPreferido } = {}) {
   if (!lido) {
     toast.info('Primeiro acesso nesta obra', perfil === 'visualizador'
       ? 'Ainda não há dados salvos nesta obra.'
-      : 'Comece cadastrando as máquinas. Use "Salvar na obra" para gravar.');
+      : 'Comece cadastrando os equipamentos. Use "Salvar na obra" para gravar.');
   }
 }
 
@@ -7142,8 +7142,9 @@ function criarBaseDemonstrativa() {
     if (a.data <= dataIso(14)) a.nfId = 1;
     else if (a.data <= dataIso(7)) a.nfId = 2;
   });
-  notas.forEach((n) => { n.litrosNf = somar(abs.filter((a) => a.nfId === n.id), 'litros'); });
+  notas.forEach((n) => { n.litrosNf = somar(abs.filter((a) => a.nfId === n.id), 'litros'); n.descricao = 'Óleo diesel S10 (fictício)'; });
   notas[1].litrosNf += 15;   // divergencia ficticia para demonstrar o alerta
+  notas.forEach((n) => { n.valorTotal = Math.round(n.litrosNf * n.valorUnitario * 100) / 100; });
   return { ...criarBaseVazia(FORMATO_BASE), dados: { maquinas: maqs, abastecimentos: abs, nfs: notas } };
 }
 
@@ -7175,7 +7176,7 @@ function maquinaPorId(id) {
 }
 function nomeMaquina(id) {
   const m = maquinaPorId(id);
-  return m ? `${m.codigo} · ${m.descricao}` : '(máquina removida)';
+  return m ? `${m.codigo} · ${m.descricao}` : '(equipamento removido)';
 }
 function nfPorId(id) {
   return nfs.find((n) => n.id === Number(id)) || null;
@@ -7215,6 +7216,7 @@ function resumoNf(nf) {
     litrosLancados: litros,
     diferenca: nf.litrosNf != null ? arred2(nf.litrosNf - litros) : null,
     valorTotal: arred2(somar(lista.map((a) => ({ v: arred2(a.litros * nf.valorUnitario) })), 'v')),
+    valorNf: nf.litrosNf != null ? arred2(nf.litrosNf * nf.valorUnitario) : null,
     ref: nf,
   };
 }
@@ -7228,67 +7230,430 @@ function alertaFicticio() {
   return criarAlerta({ tipo: 'info', titulo: 'Ambiente de demonstração', mensagem: AVISO_FICTICIO, fechavel: true });
 }
 
-const avisoSalvar = () => criarAlerta({ tipo: 'info', mensagem: 'Para gravar na base, use Controlador > Ferramentas > Salvar na nuvem / Salvar na base existente.' });
 
 
 /* =============================================================================
-   03. PAGINA: PAINEL
+   03. TELA UNICA: CONTROLE DE COMBUSTIVEL (v1.2)
+   Botoes Cadastrar equipamento / Lancar abastecimento / Vincular NF e, embaixo,
+   abas com os abastecimentos, as notas fiscais e os equipamentos.
    ========================================================================== */
 
-function paginaPainel(app) {
+let abaAtiva = 'abastecimentos';
+
+/** Valor total da NF = quantidade (L) x valor unitario. */
+const valorTotalNf = (nf) => arred2((Number(nf.litrosNf) || 0) * (Number(nf.valorUnitario) || 0));
+
+function tabelaAbastecimentos() {
+  let filtros = null;
+  const linhas = linhasAbastecimento();
+  const tabela = criarTabela({
+    dados: linhas,
+    porPagina: 20,
+    listrada: true,
+    ordenacao: { campo: 'data', direcao: 'desc' },
+    linhaVariante: (r) => (r.nfId ? null : 'warning'),
+    vazio: {
+      titulo: 'Nenhum abastecimento encontrado',
+      mensagem: abastecimentos.length ? 'Ajuste os filtros ou limpe a pesquisa.' : 'Use "Lançar abastecimento" para lançar o primeiro.',
+    },
+    onAtualizar: ({ total, filtrados }) => filtros?.definirMeta(`${filtrados} de ${total} abastecimentos`),
+    colunas: [
+      { campo: 'data', titulo: 'Data', tipo: 'data', fixa: true },
+      { campo: 'maquina', titulo: 'Equipamento' },
+      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
+      { campo: 'horimetro', titulo: 'Horímetro / km', tipo: 'numero' },
+      { campo: 'observacao', titulo: 'Observação' },
+      { campo: 'lancadoPor', titulo: 'Lançado por' },
+      {
+        campo: 'situacao', titulo: 'NF',
+        render: (v, l) => criarBadge({ texto: l.nfId ? `NF ${l.nfNumero}` : 'Sem NF', variante: l.nfId ? 'success' : 'warning' }),
+      },
+      { campo: 'valorTotal', titulo: 'Valor', tipo: 'moeda', total: 'soma' },
+      {
+        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
+        render: (_, l) => h('div', { class: 'ctc-btn-group' },
+          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar', apenasEdicao: true, onClick: () => abrirModalAbastecimento(l.ref) }),
+          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Excluir', apenasEdicao: true, onClick: () => excluirAbastecimento(l.ref) })),
+      },
+    ],
+  });
+  filtros = criarBarraFiltros({
+    busca: { placeholder: 'Pesquisar equipamento, observação, NF...' },
+    selects: [{ campo: 'situacao', rotulo: 'Situação', opcoes: ['Pendente de NF', 'Com NF'] }],
+    multiplos: [{ campo: 'maquina', rotulo: 'Equipamento', opcoes: [...new Set(linhas.map((l) => l.maquina))].sort() }],
+    extras: [{ texto: 'Limpar', icone: 'fechar', variante: 'ghost', onClick: () => filtros.limpar() }],
+    onMudar: (estado) => tabela.atualizarConsulta(estado),
+  });
+  return h('div', { class: 'ctc-stack' }, filtros.elemento, tabela.elemento);
+}
+
+function tabelaNotas() {
+  const tabela = criarTabela({
+    dados: nfs.map(resumoNf),
+    porPagina: 20,
+    listrada: true,
+    altura: 'auto',
+    ordenacao: { campo: 'emissao', direcao: 'desc' },
+    linhaVariante: (r) => (r.diferenca ? 'warning' : null),
+    vazio: { titulo: 'Nenhuma NF lançada', mensagem: 'Use "Vincular NF" quando o fornecedor emitir a nota.' },
+    colunas: [
+      { campo: 'numero', titulo: 'Nº NF', fixa: true },
+      { campo: 'emissao', titulo: 'Data', tipo: 'data' },
+      { campo: 'fornecedor', titulo: 'Empresa' },
+      { campo: 'descricao', titulo: 'Descrição' },
+      { campo: 'litrosNf', titulo: 'Quantidade (L)', tipo: 'numero', total: 'soma' },
+      { campo: 'valorUnitario', titulo: 'Valor unitário', formatar: (v) => fmtUnit(v) },
+      { campo: 'valorNf', titulo: 'Valor total', tipo: 'moeda', total: 'soma' },
+      { campo: 'qtd', titulo: 'Abast.', tipo: 'numero', total: 'soma' },
+      {
+        campo: 'diferenca', titulo: 'Conferência',
+        render: (v, l) => (v == null ? '—' : criarBadge({
+          texto: v ? `${v > 0 ? '+' : ''}${formatarNumero(v)} L` : 'Confere',
+          variante: v ? 'warning' : 'success',
+        })),
+      },
+      {
+        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
+        render: (_, l) => h('div', { class: 'ctc-btn-group' },
+          criarBotao({ icone: 'excel', variante: 'ghost', tamanho: 'sm', titulo: 'Extrair relatório desta NF', onClick: () => extrairRelatorio(l.id) }),
+          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar NF', apenasEdicao: true, onClick: () => abrirModalEditarNf(l.ref) }),
+          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Desvincular NF', apenasEdicao: true, onClick: () => desvincularNf(l.ref) })),
+      },
+    ],
+  });
+  return tabela.elemento;
+}
+
+function tabelaEquipamentos() {
+  const linhas = maquinas.map((m) => {
+    const lista = abastecimentos.filter((a) => a.maquinaId === m.id);
+    return { ...m, situacao: m.ativa !== false ? 'Ativo' : 'Inativo', qtd: lista.length, litros: somar(lista, 'litros'), ref: m };
+  });
+  return criarTabela({
+    dados: linhas,
+    porPagina: 0,
+    listrada: true,
+    altura: 'auto',
+    ordenacao: { campo: 'codigo', direcao: 'asc' },
+    vazio: { titulo: 'Nenhum equipamento cadastrado', mensagem: 'Use "Cadastrar equipamento".' },
+    colunas: [
+      { campo: 'codigo', titulo: 'Código', fixa: true },
+      { campo: 'descricao', titulo: 'Descrição' },
+      { campo: 'tipo', titulo: 'Tipo' },
+      { campo: 'situacao', titulo: 'Situação', render: (v) => criarBadge({ texto: v, variante: v === 'Ativo' ? 'success' : 'neutral' }) },
+      { campo: 'qtd', titulo: 'Abastecimentos', tipo: 'numero', total: 'soma' },
+      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
+      {
+        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
+        render: (_, l) => h('div', { class: 'ctc-btn-group' },
+          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar', apenasEdicao: true, onClick: () => abrirModalMaquina(l.ref) }),
+          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Excluir', apenasEdicao: true, onClick: () => excluirMaquina(l.ref) })),
+      },
+    ],
+  }).elemento;
+}
+
+function paginaControle() {
   const pendentes = abastecimentos.filter((a) => !a.nfId);
-  const litrosTotal = somar(abastecimentos, 'litros');
-  const litrosPend = somar(pendentes, 'litros');
-  const resumos = nfs.map(resumoNf);
-  const custoTotal = arred2(somar(resumos, 'valorTotal'));
-  const divergentes = resumos.filter((r) => r.diferenca);
+  const valorNfs = arred2(somar(nfs.map((n) => ({ v: valorTotalNf(n) })), 'v'));
 
   const indicadores = h('div', { class: 'ctc-grid ctc-grid--4' },
-    criarKpi({ rotulo: 'Litros lançados', valor: fmtLitros(litrosTotal), sub: `${abastecimentos.length} abastecimentos`, tamanho: 'lg' }).elemento,
+    criarKpi({ rotulo: 'Equipamentos', valor: maquinas.filter((m) => m.ativa !== false).length, formato: 'numero', sub: 'ativos na obra' }).elemento,
+    criarKpi({ rotulo: 'Litros lançados', valor: fmtLitros(somar(abastecimentos, 'litros')), sub: `${abastecimentos.length} abastecimentos` }).elemento,
     criarKpi({
-      rotulo: 'Pendentes de NF', valor: fmtLitros(litrosPend), sub: `${pendentes.length} abastecimentos sem NF`,
-      tamanho: 'lg', destaque: pendentes.length ? 'negative' : 'positive',
+      rotulo: 'Sem NF', valor: fmtLitros(somar(pendentes, 'litros')), sub: `${pendentes.length} abastecimentos aguardando NF`,
+      destaque: pendentes.length ? 'negative' : 'positive',
     }).elemento,
-    criarKpi({ rotulo: 'Custo faturado', valor: formatarMoedaCompacta(custoTotal), sub: formatarMoeda(custoTotal), tamanho: 'lg', variante: 'accent', tema: 1 }).elemento,
-    criarKpi({
-      rotulo: 'Notas fiscais', valor: nfs.length, formato: 'numero',
-      sub: divergentes.length ? `${divergentes.length} com diferença de litros` : 'sem divergência de litros',
-      destaque: divergentes.length ? 'negative' : 'positive',
-    }).elemento);
+    criarKpi({ rotulo: 'Notas fiscais', valor: formatarMoeda(valorNfs), sub: `${nfs.length} NF lançadas`, variante: 'accent', tema: 1 }).elemento);
 
-  const ativos = maquinas.filter((m) => abastecimentos.some((a) => a.maquinaId === m.id));
-  const litrosPorMaquina = ordenar(ativos.map((m) => ({
-    rotulo: m.codigo, valor: somar(abastecimentos.filter((a) => a.maquinaId === m.id), 'litros'),
-  })), 'valor', 'desc', 'numero');
-  const custoPorMaquina = ordenar(ativos.map((m) => ({
-    rotulo: m.codigo,
-    valor: arred2(somar(linhasAbastecimento(abastecimentos.filter((a) => a.maquinaId === m.id)), 'valorTotal')),
-  })), 'valor', 'desc', 'numero');
+  const abas = criarAbas({
+    ativa: abaAtiva,
+    onMudar: (id) => { abaAtiva = id; },
+    abas: [
+      { id: 'abastecimentos', texto: `Abastecimentos (${abastecimentos.length})`, conteudo: tabelaAbastecimentos },
+      { id: 'notas', texto: `Notas fiscais (${nfs.length})`, conteudo: tabelaNotas },
+      { id: 'equipamentos', texto: `Equipamentos (${maquinas.length})`, conteudo: tabelaEquipamentos },
+    ],
+  });
 
-  const tag = baseDemonstrativa ? 'Fictício' : null;
   return [
     alertaFicticio(),
-    pendentes.length ? criarAlerta({
-      tipo: 'warning', titulo: `${pendentes.length} abastecimentos aguardando NF`,
-      mensagem: `${fmtLitros(litrosPend)} ainda sem nota fiscal vinculada.`,
-      acoes: [{ texto: 'Vincular NF', onClick: () => app.navegar('vincular') }],
-    }) : null,
     indicadores,
-    h('div', { class: 'ctc-grid ctc-grid--2 ctc-grid--gap-lg' },
-      criarPainel({ titulo: 'Litros por máquina', icone: 'barras', tema: 1, tag, conteudo: criarBarras({ itens: litrosPorMaquina, formato: 'numero', casas: 0 }) }).elemento,
-      criarPainel({ titulo: 'Custo faturado por máquina', icone: 'moeda', tema: 2, tag, conteudo: criarBarras({ itens: custoPorMaquina, formato: 'moeda', casas: 2 }) }).elemento),
+    criarPainel({ titulo: 'Controle de combustível', icone: 'tabela', conteudo: abas.elemento }).elemento,
   ];
 }
 
 
 /* =============================================================================
-   04. PAGINA: ABASTECIMENTOS
+   04. VINCULAR NF (janela)
+   Empresa, descricao, quantidade (L), valor unitario e valor total (= unitario x
+   quantidade, automatico). Embaixo, os abastecimentos ainda sem NF: o interruptor
+   escolhe os que entram nesta NF.
+   ========================================================================== */
+
+function camposNf(nfAtual = null) {
+  return [
+    {
+      nome: 'numero', rotulo: 'Nº da NF', obrigatorio: true,
+      regras: { validar: (v) => (nfs.some((n) => n !== nfAtual && String(n.numero).trim() === String(v).trim()) ? 'Esta NF já foi lançada.' : true) },
+    },
+    { nome: 'emissao', rotulo: 'Data da NF', tipo: 'data', obrigatorio: true },
+    { nome: 'fornecedor', rotulo: 'Empresa', obrigatorio: true },
+    { nome: 'descricao', rotulo: 'Descrição', larguraTotal: true, placeholder: 'ex.: Óleo diesel S10' },
+    { nome: 'litrosNf', rotulo: 'Quantidade (L)', tipo: 'numero', sufixo: 'L', obrigatorio: true, regras: { minimo: 0.01 } },
+    { nome: 'valorUnitario', rotulo: 'Valor unitário (R$/L)', tipo: 'numero', prefixo: 'R$', obrigatorio: true, regras: { minimo: 0.0001 }, dica: 'Aceita até 4 casas, ex.: 6,1890' },
+    { nome: 'valorTotal', rotulo: 'Valor total', tipo: 'moeda', somenteLeitura: true, dica: 'Quantidade × valor unitário' },
+  ];
+}
+
+/** Liga o calculo automatico do valor total num formulario de NF. */
+function ligarValorTotal(formulario, aoMudar) {
+  const campoTotal = formulario.elemento.querySelector('[name="valorTotal"]');
+  const calcular = () => {
+    const v = formulario.obterValores();
+    const total = v.litrosNf != null && v.valorUnitario != null ? valorTotalNf(v) : null;
+    if (campoTotal) campoTotal.value = total == null ? '' : formatarMoeda(total, { simbolo: false });
+    if (typeof aoMudar === 'function') aoMudar(v);
+  };
+  formulario.elemento.addEventListener('input', calcular);
+  formulario.elemento.addEventListener('change', calcular);
+  calcular();
+}
+
+function abrirVincularNf() {
+  const pendentes = ordenar(linhasAbastecimento(abastecimentos.filter((a) => !a.nfId)), [{ campo: 'data' }, { campo: 'maquina' }]);
+  if (!pendentes.length) {
+    toast.info('Nenhum abastecimento sem NF', 'Lance os abastecimentos antes de vincular a NF.');
+    return;
+  }
+  const marcados = new Set();
+  const interruptores = new Map();
+  const fornecedores = nfs.map((n) => n.fornecedor).filter(Boolean);
+
+  const kLitros = criarKpi({ rotulo: 'Litros marcados', valor: '0 L', sub: '0 abastecimentos' });
+  const kNf = criarKpi({ rotulo: 'Quantidade da NF', valor: '—' });
+  const kDif = criarKpi({ rotulo: 'Diferença (NF − marcados)', valor: '—' });
+
+  let formulario = null;
+  function atualizarResumo() {
+    const sel = pendentes.filter((p) => marcados.has(p.id));
+    const litros = somar(sel, 'litros');
+    const v = formulario ? formulario.obterValores() : {};
+    kLitros.atualizar({ valor: fmtLitros(litros), sub: `${sel.length} abastecimentos` });
+    kNf.atualizar({ valor: v.litrosNf != null ? fmtLitros(v.litrosNf) : '—' });
+    if (v.litrosNf != null && sel.length) {
+      const dif = arred2(v.litrosNf - litros);
+      kDif.atualizar({ valor: `${dif > 0 ? '+' : ''}${formatarNumero(dif)} L`, sub: dif ? 'confira antes de vincular' : 'litros conferem', destaque: dif ? 'negative' : 'positive' });
+    } else {
+      kDif.atualizar({ valor: '—', sub: '', destaque: 'neutral' });
+    }
+  }
+
+  const tabela = criarTabela({
+    dados: pendentes,
+    porPagina: 0,
+    compacta: true,
+    altura: 'auto',
+    colunas: [
+      {
+        campo: 'marcar', titulo: 'Incluir', ordenavel: false,
+        render: (_, l) => {
+          const s = criarLinhaInterruptor({
+            texto: '', ligado: marcados.has(l.id),
+            onMudar: (on) => { if (on) marcados.add(l.id); else marcados.delete(l.id); atualizarResumo(); },
+          });
+          interruptores.set(l.id, s);
+          return s.elemento;
+        },
+      },
+      { campo: 'data', titulo: 'Data', tipo: 'data' },
+      { campo: 'maquina', titulo: 'Equipamento' },
+      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
+      { campo: 'lancadoPor', titulo: 'Lançado por' },
+      { campo: 'observacao', titulo: 'Observação' },
+    ],
+  });
+
+  const marcarTodos = (on) => {
+    pendentes.forEach((p) => { if (on) marcados.add(p.id); else marcados.delete(p.id); interruptores.get(p.id)?.definir(on); });
+    atualizarResumo();
+  };
+
+  formulario = criarFormulario({
+    colunas: 3, semBotoes: true,
+    valores: { emissao: formatarData(new Date(), 'iso'), fornecedor: fornecedores[fornecedores.length - 1] || '', descricao: 'Óleo diesel' },
+    campos: camposNf(),
+    onEnviar: async (v) => {
+      const sel = pendentes.filter((p) => marcados.has(p.id));
+      if (!sel.length) { toast.aviso('Nenhum abastecimento ligado', 'Ligue os abastecimentos que entram nesta NF.'); return; }
+      const litros = somar(sel, 'litros');
+      const dif = arred2(v.litrosNf - litros);
+      const ok = await confirmar({
+        titulo: `Vincular NF ${v.numero}?`,
+        mensagem: `${sel.length} abastecimentos (${fmtLitros(litros)}) · NF ${fmtLitros(v.litrosNf)} × ${fmtUnit(v.valorUnitario)} = ${formatarMoeda(valorTotalNf(v))}.`
+          + (dif ? ` Atenção: diferença de ${formatarNumero(dif)} L entre a NF e os abastecimentos marcados.` : ''),
+        textoConfirmar: 'Vincular',
+      });
+      if (!ok) return;
+      const nf = {
+        id: proximoIdDe(nfs), numero: String(v.numero).trim(), emissao: v.emissao,
+        fornecedor: v.fornecedor, descricao: v.descricao || '',
+        litrosNf: v.litrosNf, valorUnitario: v.valorUnitario, valorTotal: valorTotalNf(v),
+        vinculadaPor: quemEsta(), vinculadaEm: new Date().toISOString(),
+      };
+      nfs.push(nf);
+      sel.forEach((p) => { p.ref.nfId = nf.id; });
+      sessao.marcarAlteracao();
+      toast.sucesso(`NF ${nf.numero} vinculada`, `${sel.length} abastecimentos · ${formatarMoeda(nf.valorTotal)}`);
+      modal.fechar();
+      abaAtiva = 'notas';
+      atualizarPagina();
+    },
+  });
+  ligarValorTotal(formulario, atualizarResumo);
+
+  const modal = criarModal({
+    titulo: 'Vincular NF',
+    tamanho: 'xl',
+    destruirAoFechar: true,
+    conteudo: h('div', { class: 'ctc-stack' },
+      formulario.elemento,
+      h('div', { class: 'ctc-cluster' },
+        h('strong', {}, `Abastecimentos sem NF (${pendentes.length})`),
+        h('span', { class: 'ctc-spacer' }),
+        criarBotao({ texto: 'Ligar todos', icone: 'check', variante: 'outline', tamanho: 'sm', onClick: () => marcarTodos(true) }),
+        criarBotao({ texto: 'Desligar todos', icone: 'fechar', variante: 'ghost', tamanho: 'sm', onClick: () => marcarTodos(false) })),
+      tabela.elemento,
+      h('div', { class: 'ctc-grid ctc-grid--3' }, kLitros.elemento, kNf.elemento, kDif.elemento)),
+    acoes: [
+      { texto: 'Cancelar', variante: 'outline' },
+      { texto: 'Vincular NF', variante: 'primary', fechar: false, onClick: () => formulario.enviar() },
+    ],
+  });
+  modal.abrir();
+  atualizarResumo();
+}
+
+function abrirModalEditarNf(nf) {
+  const formulario = criarFormulario({
+    colunas: 3, semBotoes: true, valores: nf,
+    campos: camposNf(nf),
+    onEnviar: async (v) => {
+      Object.assign(nf, {
+        numero: String(v.numero).trim(), emissao: v.emissao, fornecedor: v.fornecedor, descricao: v.descricao || '',
+        litrosNf: v.litrosNf, valorUnitario: v.valorUnitario, valorTotal: valorTotalNf(v),
+      });
+      sessao.marcarAlteracao();
+      toast.sucesso(`NF ${nf.numero} atualizada`);
+      modal.fechar();
+      atualizarPagina();
+    },
+  });
+  ligarValorTotal(formulario);
+  const modal = criarModal({
+    titulo: `Editar NF ${nf.numero}`, tamanho: 'lg', destruirAoFechar: true,
+    conteudo: formulario.elemento,
+    acoes: [
+      { texto: 'Cancelar', variante: 'outline' },
+      { texto: 'Salvar alterações', variante: 'primary', fechar: false, onClick: () => formulario.enviar() },
+    ],
+  });
+  modal.abrir();
+}
+
+async function desvincularNf(nf) {
+  const qtd = abastecimentos.filter((a) => a.nfId === nf.id).length;
+  const ok = await confirmar({
+    titulo: `Desvincular NF ${nf.numero}?`,
+    mensagem: `A NF será removida e os ${qtd} abastecimentos voltam a ficar sem NF. Os lançamentos não são apagados.`,
+    textoConfirmar: 'Desvincular',
+    perigo: true,
+  });
+  if (!ok) return;
+  abastecimentos.forEach((a) => { if (a.nfId === nf.id) a.nfId = null; });
+  nfs.splice(nfs.indexOf(nf), 1);
+  sessao.marcarAlteracao();
+  toast.aviso(`NF ${nf.numero} desvinculada`, `${qtd} abastecimentos voltaram para "sem NF".`);
+  atualizarPagina();
+}
+
+
+/* =============================================================================
+   05. CONTROLADOR > RELATORIOS
+   Escolhe a NF e extrai o relatorio em Excel: dados da NF, litros e valor por
+   equipamento e cada abastecimento.
+   ========================================================================== */
+
+function extrairRelatorio(id, botao = null) {
+  const executar = async () => {
+    try {
+      const nome = await exportarExcel([Number(id)]);
+      toast.sucesso('Relatório extraído', nome);
+    } catch (erro) {
+      toast.erro('Não foi possível gerar o relatório', erro.message);
+    }
+  };
+  if (botao) comCarregamento(botao, executar); else executar();
+}
+
+function abaRelatorios() {
+  if (!nfs.length) {
+    return criarAlerta({ tipo: 'info', titulo: 'Nenhuma NF lançada', mensagem: 'Vincule uma NF na tela do controle para extrair o relatório.' });
+  }
+  const lista = ordenar([...nfs], 'emissao', 'desc');
+  let escolhida = lista[0].id;
+  const previa = h('div', {});
+
+  function desenhar() {
+    const nf = nfPorId(escolhida);
+    const r = resumoNf(nf);
+    previa.replaceChildren(h('div', { class: 'ctc-stack' },
+      h('div', { class: 'ctc-grid ctc-grid--4' },
+        criarKpi({ rotulo: 'Quantidade NF', valor: fmtLitros(nf.litrosNf || 0) }).elemento,
+        criarKpi({ rotulo: 'Valor unitário', valor: fmtUnit(nf.valorUnitario) }).elemento,
+        criarKpi({ rotulo: 'Valor total NF', valor: formatarMoeda(r.valorNf), variante: 'accent', tema: 1 }).elemento,
+        criarKpi({ rotulo: 'Abastecimentos', valor: r.qtd, formato: 'numero', sub: fmtLitros(r.litrosLancados) }).elemento),
+      r.diferenca ? criarAlerta({ tipo: 'warning', mensagem: `A NF tem ${formatarNumero(r.diferenca)} L de diferença em relação aos abastecimentos vinculados.` }) : null,
+      criarTabela({
+        dados: montarRelatorio([nf.id], false), porPagina: 0, compacta: true, altura: 'auto', rotuloTotal: 'Total',
+        colunas: [
+          { campo: 'equipamento', titulo: 'Equipamento' },
+          { campo: 'qtd', titulo: 'Abast.', tipo: 'numero', total: 'soma' },
+          { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
+          { campo: 'valorUnitario', titulo: 'Valor unitário', formatar: (v) => fmtUnit(v) },
+          { campo: 'valorTotal', titulo: 'Valor total', tipo: 'moeda', total: 'soma' },
+        ],
+      }).elemento));
+  }
+
+  const formulario = criarFormulario({
+    colunas: 1, semBotoes: true, valores: { nf: String(escolhida) },
+    campos: [{
+      nome: 'nf', rotulo: 'Nota fiscal', tipo: 'select', obrigatorio: true,
+      opcoes: lista.map((n) => ({ valor: String(n.id), texto: `NF ${n.numero} · ${formatarData(n.emissao)} · ${n.fornecedor}` })),
+    }],
+  });
+  formulario.elemento.addEventListener('change', () => { escolhida = Number(formulario.obterValores().nf); desenhar(); });
+
+  const botao = criarBotao({ texto: 'Extrair relatório (Excel)', icone: 'excel', variante: 'success' });
+  botao.addEventListener('click', () => extrairRelatorio(escolhida, botao));
+
+  desenhar();
+  return h('div', { class: 'ctc-stack' },
+    formulario.elemento,
+    h('div', { class: 'ctc-cluster' }, h('span', { class: 'ctc-spacer' }), botao),
+    previa);
+}
+
+
+/* =============================================================================
+   06. LANCAMENTO DE ABASTECIMENTO (janela)
    ========================================================================== */
 
 function camposAbastecimento() {
   return [
     { nome: 'data', rotulo: 'Data', tipo: 'data', obrigatorio: true },
-    { nome: 'maquinaId', rotulo: 'Máquina', tipo: 'select', opcoes: opcoesMaquinas(), obrigatorio: true, placeholder: 'Selecione' },
+    { nome: 'maquinaId', rotulo: 'Equipamento', tipo: 'select', opcoes: opcoesMaquinas(), obrigatorio: true, placeholder: 'Selecione' },
     { nome: 'litros', rotulo: 'Litros', tipo: 'numero', obrigatorio: true, sufixo: 'L', regras: { minimo: 0.01, maximo: 100000 } },
     { nome: 'horimetro', rotulo: 'Horímetro / km', tipo: 'numero', dica: 'Opcional', regras: { minimo: 0 } },
     { nome: 'observacao', rotulo: 'Observação', tipo: 'textarea', larguraTotal: true, regras: { maxCaracteres: 300 } },
@@ -7297,8 +7662,8 @@ function camposAbastecimento() {
 
 function abrirModalAbastecimento(registro = null) {
   if (!maquinas.some((m) => m.ativa !== false)) {
-    toast.aviso('Cadastre uma máquina primeiro', 'Menu > Cadastros > Máquinas.');
-    appAtual?.navegar('maquinas');
+    toast.aviso('Cadastre um equipamento primeiro', 'Use o botão "Cadastrar equipamento".');
+    abrirModalMaquina();
     return;
   }
   const editando = Boolean(registro);
@@ -7338,7 +7703,7 @@ function abrirModalAbastecimento(registro = null) {
   });
 
   const modal = criarModal({
-    titulo: editando ? 'Editar abastecimento' : 'Novo abastecimento',
+    titulo: editando ? 'Editar abastecimento' : 'Lançar abastecimento',
     tamanho: 'md',
     conteudo: [
       nf ? criarAlerta({ tipo: 'warning', mensagem: `Este abastecimento já está na NF ${nf.numero}. Alterar os litros muda o valor da NF.` }) : null,
@@ -7379,308 +7744,11 @@ async function excluirAbastecimento(registro) {
   });
 }
 
-function paginaAbastecimentos() {
-  let filtros = null;
-  const linhas = linhasAbastecimento();
-
-  const tabela = criarTabela({
-    dados: linhas,
-    porPagina: 20,
-    listrada: true,
-    ordenacao: { campo: 'data', direcao: 'desc' },
-    linhaVariante: (r) => (r.nfId ? null : 'warning'),
-    vazio: {
-      titulo: 'Nenhum abastecimento encontrado',
-      mensagem: abastecimentos.length ? 'Ajuste os filtros ou limpe a pesquisa.' : 'Use "Novo abastecimento" para lançar o primeiro.',
-    },
-    onAtualizar: ({ total, filtrados }) => filtros?.definirMeta(`${filtrados} de ${total} abastecimentos`),
-    colunas: [
-      { campo: 'data', titulo: 'Data', tipo: 'data', fixa: true },
-      { campo: 'maquina', titulo: 'Máquina' },
-      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
-      { campo: 'horimetro', titulo: 'Horímetro / km', tipo: 'numero' },
-      { campo: 'observacao', titulo: 'Observação' },
-      { campo: 'lancadoPor', titulo: 'Lançado por' },
-      {
-        campo: 'situacao', titulo: 'NF',
-        render: (v, l) => criarBadge({ texto: l.nfId ? `NF ${l.nfNumero}` : 'Pendente', variante: l.nfId ? 'success' : 'warning' }),
-      },
-      { campo: 'valorTotal', titulo: 'Valor', tipo: 'moeda', total: 'soma' },
-      {
-        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
-        render: (_, l) => h('div', { class: 'ctc-btn-group' },
-          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar', apenasEdicao: true, onClick: () => abrirModalAbastecimento(l.ref) }),
-          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Excluir', apenasEdicao: true, onClick: () => excluirAbastecimento(l.ref) })),
-      },
-    ],
-  });
-
-  filtros = criarBarraFiltros({
-    busca: { placeholder: 'Pesquisar máquina, observação, NF...' },
-    selects: [{ campo: 'situacao', rotulo: 'Situação', opcoes: ['Pendente de NF', 'Com NF'] }],
-    multiplos: [{ campo: 'maquina', rotulo: 'Máquina', opcoes: [...new Set(linhas.map((l) => l.maquina))].sort() }],
-    extras: [{ texto: 'Limpar', icone: 'fechar', variante: 'ghost', onClick: () => filtros.limpar() }],
-    onMudar: (estado) => tabela.atualizarConsulta(estado),
-  });
-
-  return [
-    alertaFicticio(),
-    filtros.elemento,
-    criarPainel({ titulo: 'Abastecimentos', icone: 'tabela', semEspaco: true, conteudo: tabela.elemento }).elemento,
-  ];
-}
-
 
 /* =============================================================================
-   05. PAGINA: VINCULAR NF
-   O colaborador filtra o periodo, marca os abastecimentos pendentes e informa
-   os dados da NF. Um valor unitario por NF.
+   07. RELATORIO POR NF (Excel)
    ========================================================================== */
 
-function paginaVincular() {
-  const pendentes = linhasAbastecimento(abastecimentos.filter((a) => !a.nfId));
-  const marcados = new Set();
-  const datas = pendentes.map((p) => p.data).sort();
-  let periodo = { de: datas[0] || '', ate: datas[datas.length - 1] || '' };
-  const interruptores = new Map();
-
-  const noPeriodo = () => pendentes.filter((p) => (!periodo.de || p.data >= periodo.de) && (!periodo.ate || p.data <= periodo.ate));
-
-  /* ---- resumo da selecao ---- */
-  const kLitros = criarKpi({ rotulo: 'Litros marcados', valor: '0 L', sub: '0 abastecimentos' });
-  const kLitrosNf = criarKpi({ rotulo: 'Litros da NF', valor: '—', sub: 'informe abaixo' });
-  const kDif = criarKpi({ rotulo: 'Diferença (NF − lançado)', valor: '—' });
-  const kTotal = criarKpi({ rotulo: 'Valor total', valor: '—', variante: 'accent', tema: 1 });
-
-  let formNf = null;
-  function atualizarResumo() {
-    const sel = pendentes.filter((p) => marcados.has(p.id));
-    const litros = somar(sel, 'litros');
-    const v = formNf ? formNf.obterValores() : {};
-    kLitros.atualizar({ valor: fmtLitros(litros), sub: `${sel.length} abastecimentos` });
-    kLitrosNf.atualizar({ valor: v.litrosNf != null ? fmtLitros(v.litrosNf) : '—', sub: v.litrosNf != null ? 'conforme a NF' : 'informe abaixo' });
-    if (v.litrosNf != null) {
-      const dif = arred2(v.litrosNf - litros);
-      kDif.atualizar({ valor: `${dif > 0 ? '+' : ''}${formatarNumero(dif)} L`, sub: dif ? 'confira antes de vincular' : 'litros conferem', destaque: dif ? 'negative' : 'positive' });
-    } else {
-      kDif.atualizar({ valor: '—', sub: '', destaque: 'neutral' });
-    }
-    kTotal.atualizar({ valor: v.valorUnitario ? formatarMoeda(arred2(sel.reduce((s, p) => s + arred2(p.litros * v.valorUnitario), 0))) : '—' });
-  }
-
-  /* ---- tabela de pendentes com interruptor ---- */
-  const tabela = criarTabela({
-    dados: noPeriodo(),
-    porPagina: 0,
-    compacta: true,
-    ordenacao: { campo: 'data', direcao: 'asc' },
-    vazio: { titulo: 'Nenhum abastecimento pendente no período', mensagem: pendentes.length ? 'Ajuste o período.' : 'Todos os abastecimentos já têm NF.' },
-    colunas: [
-      {
-        campo: 'marcar', titulo: '', ordenavel: false,
-        render: (_, l) => {
-          const s = criarLinhaInterruptor({
-            texto: '', ligado: marcados.has(l.id),
-            onMudar: (on) => { if (on) marcados.add(l.id); else marcados.delete(l.id); atualizarResumo(); },
-          });
-          interruptores.set(l.id, s);
-          return s.elemento;
-        },
-      },
-      { campo: 'data', titulo: 'Data', tipo: 'data' },
-      { campo: 'maquina', titulo: 'Máquina' },
-      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
-      { campo: 'lancadoPor', titulo: 'Lançado por' },
-      { campo: 'observacao', titulo: 'Observação' },
-    ],
-  });
-
-  function marcarTodos(on) {
-    noPeriodo().forEach((p) => { if (on) marcados.add(p.id); else marcados.delete(p.id); interruptores.get(p.id)?.definir(on); });
-    atualizarResumo();
-  }
-
-  const formPeriodo = criarFormulario({
-    colunas: 2, semBotoes: true, valores: periodo,
-    campos: [
-      { nome: 'de', rotulo: 'De', tipo: 'data' },
-      { nome: 'ate', rotulo: 'Até', tipo: 'data' },
-    ],
-  });
-  formPeriodo.elemento.addEventListener('change', () => {
-    const v = formPeriodo.obterValores();
-    periodo = { de: v.de || '', ate: v.ate || '' };
-    // desmarca o que saiu do periodo
-    const dentro = new Set(noPeriodo().map((p) => p.id));
-    [...marcados].forEach((id) => { if (!dentro.has(id)) marcados.delete(id); });
-    tabela.definirDados(noPeriodo());
-    atualizarResumo();
-  });
-
-  /* ---- dados da NF ---- */
-  const fornecedores = [...new Set(nfs.map((n) => n.fornecedor).filter(Boolean))];
-  formNf = criarFormulario({
-    colunas: 3, semBotoes: true,
-    valores: { emissao: formatarData(new Date(), 'iso'), fornecedor: fornecedores[fornecedores.length - 1] || '' },
-    campos: [
-      {
-        nome: 'numero', rotulo: 'Nº da NF', obrigatorio: true,
-        regras: { validar: (v) => (nfs.some((n) => String(n.numero).trim() === String(v).trim()) ? 'Esta NF já foi lançada.' : true) },
-      },
-      { nome: 'emissao', rotulo: 'Data de emissão', tipo: 'data', obrigatorio: true },
-      { nome: 'fornecedor', rotulo: 'Fornecedor', obrigatorio: true },
-      { nome: 'valorUnitario', rotulo: 'Valor unitário (R$/L)', tipo: 'numero', prefixo: 'R$', obrigatorio: true, regras: { minimo: 0.01 }, dica: 'Aceita até 4 casas, ex.: 6,1890' },
-      { nome: 'litrosNf', rotulo: 'Litros da NF', tipo: 'numero', sufixo: 'L', dica: 'Para conferir com o lançado (opcional)', regras: { minimo: 0 } },
-    ],
-    onEnviar: async (v) => {
-      const sel = pendentes.filter((p) => marcados.has(p.id));
-      if (!sel.length) { toast.aviso('Nenhum abastecimento marcado', 'Marque os abastecimentos que entram nesta NF.'); return; }
-      const litros = somar(sel, 'litros');
-      const dif = v.litrosNf != null ? arred2(v.litrosNf - litros) : 0;
-      const total = arred2(sel.reduce((s, p) => s + arred2(p.litros * v.valorUnitario), 0));
-      const ok = await confirmar({
-        titulo: `Vincular NF ${v.numero}?`,
-        mensagem: `${sel.length} abastecimentos · ${fmtLitros(litros)} · ${fmtUnit(v.valorUnitario)}/L · total ${formatarMoeda(total)}.`
-          + (dif ? ` Atenção: a NF tem ${formatarNumero(dif)} L de diferença em relação ao lançado.` : ''),
-        textoConfirmar: 'Vincular',
-      });
-      if (!ok) return;
-      const nf = {
-        id: proximoIdDe(nfs), numero: String(v.numero).trim(), emissao: v.emissao, fornecedor: v.fornecedor,
-        valorUnitario: v.valorUnitario, litrosNf: v.litrosNf ?? null,
-        vinculadaPor: quemEsta(), vinculadaEm: new Date().toISOString(),
-      };
-      nfs.push(nf);
-      sel.forEach((p) => { p.ref.nfId = nf.id; });
-      sessao.marcarAlteracao();
-      toast.sucesso(`NF ${nf.numero} vinculada`, `${sel.length} abastecimentos · ${formatarMoeda(total)}`);
-      atualizarPagina();
-    },
-  });
-  formNf.elemento.addEventListener('change', atualizarResumo);
-  formNf.elemento.addEventListener('input', atualizarResumo);
-
-  atualizarResumo();
-  return [
-    alertaFicticio(),
-    criarPainel({
-      titulo: '1. Período e abastecimentos pendentes', icone: 'calendario', semEspaco: false,
-      acoes: [
-        { texto: 'Marcar todos', icone: 'check', variante: 'outline', apenasEdicao: true, onClick: () => marcarTodos(true) },
-        { texto: 'Desmarcar', icone: 'fechar', variante: 'ghost', apenasEdicao: true, onClick: () => marcarTodos(false) },
-      ],
-      conteudo: h('div', { class: 'ctc-stack' }, formPeriodo.elemento, tabela.elemento),
-    }).elemento,
-    criarPainel({
-      titulo: '2. Dados da nota fiscal', icone: 'documento', tema: 1,
-      conteudo: h('div', { class: 'ctc-stack' },
-        formNf.elemento,
-        h('div', { class: 'ctc-grid ctc-grid--4' }, kLitros.elemento, kLitrosNf.elemento, kDif.elemento, kTotal.elemento),
-        h('div', { class: 'ctc-cluster' },
-          h('span', { class: 'ctc-spacer' }),
-          criarBotao({ texto: 'Vincular NF aos marcados', icone: 'check', variante: 'primary', apenasEdicao: true, onClick: () => formNf.enviar() }))),
-    }).elemento,
-    avisoSalvar(),
-  ];
-}
-
-
-/* =============================================================================
-   06. PAGINA: NOTAS FISCAIS
-   ========================================================================== */
-
-function abrirModalEditarNf(nf) {
-  const formulario = criarFormulario({
-    colunas: 2, semBotoes: true, valores: nf,
-    campos: [
-      {
-        nome: 'numero', rotulo: 'Nº da NF', obrigatorio: true,
-        regras: { validar: (v) => (nfs.some((n) => n !== nf && String(n.numero).trim() === String(v).trim()) ? 'Esta NF já foi lançada.' : true) },
-      },
-      { nome: 'emissao', rotulo: 'Data de emissão', tipo: 'data', obrigatorio: true },
-      { nome: 'fornecedor', rotulo: 'Fornecedor', obrigatorio: true },
-      { nome: 'valorUnitario', rotulo: 'Valor unitário (R$/L)', tipo: 'numero', prefixo: 'R$', obrigatorio: true, regras: { minimo: 0.01 } },
-      { nome: 'litrosNf', rotulo: 'Litros da NF', tipo: 'numero', sufixo: 'L', regras: { minimo: 0 } },
-    ],
-    onEnviar: async (v) => {
-      Object.assign(nf, { ...v, numero: String(v.numero).trim(), litrosNf: v.litrosNf ?? null });
-      sessao.marcarAlteracao();
-      toast.sucesso(`NF ${nf.numero} atualizada`);
-      modal.fechar();
-      atualizarPagina();
-    },
-  });
-  const modal = criarModal({
-    titulo: `Editar NF ${nf.numero}`, tamanho: 'md', destruirAoFechar: true,
-    conteudo: formulario.elemento,
-    acoes: [
-      { texto: 'Cancelar', variante: 'outline' },
-      { texto: 'Salvar alterações', variante: 'primary', fechar: false, onClick: () => formulario.enviar() },
-    ],
-  });
-  modal.abrir();
-}
-
-async function desvincularNf(nf) {
-  const qtd = abastecimentos.filter((a) => a.nfId === nf.id).length;
-  const ok = await confirmar({
-    titulo: `Desvincular NF ${nf.numero}?`,
-    mensagem: `A NF será removida e os ${qtd} abastecimentos voltam a ficar pendentes de NF. Os lançamentos não são apagados.`,
-    textoConfirmar: 'Desvincular',
-    perigo: true,
-  });
-  if (!ok) return;
-  abastecimentos.forEach((a) => { if (a.nfId === nf.id) a.nfId = null; });
-  nfs.splice(nfs.indexOf(nf), 1);
-  sessao.marcarAlteracao();
-  toast.aviso(`NF ${nf.numero} desvinculada`, `${qtd} abastecimentos voltaram para pendentes.`);
-  atualizarPagina();
-}
-
-function paginaNotas(app) {
-  const linhas = nfs.map(resumoNf);
-  const tabela = criarTabela({
-    dados: linhas,
-    porPagina: 20,
-    listrada: true,
-    ordenacao: { campo: 'emissao', direcao: 'desc' },
-    linhaVariante: (r) => (r.diferenca ? 'warning' : null),
-    vazio: { titulo: 'Nenhuma NF vinculada', mensagem: 'Use "Vincular NF" quando o fornecedor emitir a nota.', acao: { texto: 'Vincular NF', onClick: () => app.navegar('vincular') } },
-    colunas: [
-      { campo: 'numero', titulo: 'Nº NF', fixa: true },
-      { campo: 'emissao', titulo: 'Emissão', tipo: 'data' },
-      { campo: 'fornecedor', titulo: 'Fornecedor' },
-      { campo: 'qtd', titulo: 'Abast.', tipo: 'numero', total: 'soma' },
-      { campo: 'litrosLancados', titulo: 'Litros lançados', tipo: 'numero', total: 'soma' },
-      { campo: 'litrosNf', titulo: 'Litros NF', tipo: 'numero' },
-      {
-        campo: 'diferenca', titulo: 'Diferença',
-        render: (v) => (v == null ? '—' : criarBadge({ texto: v ? `${v > 0 ? '+' : ''}${formatarNumero(v)} L` : 'Confere', variante: v ? 'warning' : 'success' })),
-      },
-      { campo: 'valorUnitario', titulo: 'R$/L', formatar: (v) => fmtUnit(v) },
-      { campo: 'valorTotal', titulo: 'Valor total', tipo: 'moeda', total: 'soma' },
-      { campo: 'vinculadaPor', titulo: 'Vinculada por' },
-      {
-        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
-        render: (_, l) => h('div', { class: 'ctc-btn-group' },
-          criarBotao({ icone: 'relatorio', variante: 'ghost', tamanho: 'sm', titulo: 'Ver relatório desta NF', onClick: () => { nfsSelecionadas = [l.id]; app.navegar('relatorio'); } }),
-          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar NF', apenasEdicao: true, onClick: () => abrirModalEditarNf(l.ref) }),
-          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Desvincular NF', apenasEdicao: true, onClick: () => desvincularNf(l.ref) })),
-      },
-    ],
-  });
-  return [
-    alertaFicticio(),
-    criarPainel({ titulo: 'Notas fiscais vinculadas', icone: 'documento', semEspaco: true, conteudo: tabela.elemento }).elemento,
-  ];
-}
-
-
-/* =============================================================================
-   07. PAGINA: RELATORIO POR NF (Excel e impressao)
-   ========================================================================== */
-
-let nfsSelecionadas = null;   // ids escolhidos; null = a NF mais recente
 
 /** Linhas do relatorio: uma por NF x equipamento (ou por abastecimento, se detalhado). */
 function montarRelatorio(ids, detalhado) {
@@ -7695,9 +7763,12 @@ function montarRelatorio(ids, detalhado) {
       }));
     } else {
       const porMaquina = new Map();
-      lista.forEach((a) => porMaquina.set(a.maquinaId, (porMaquina.get(a.maquinaId) || 0) + Number(a.litros || 0)));
-      ordenar([...porMaquina].map(([id, litros]) => ({ id, nome: nomeMaquina(id), litros })), 'nome').forEach((m) => linhas.push({
-        nf: nf.numero, emissao: nf.emissao, fornecedor: nf.fornecedor, data: null,
+      lista.forEach((a) => {
+        const atual = porMaquina.get(a.maquinaId) || { litros: 0, qtd: 0 };
+        porMaquina.set(a.maquinaId, { litros: atual.litros + Number(a.litros || 0), qtd: atual.qtd + 1 });
+      });
+      ordenar([...porMaquina].map(([id, t]) => ({ id, nome: nomeMaquina(id), ...t })), 'nome').forEach((m) => linhas.push({
+        nf: nf.numero, emissao: nf.emissao, fornecedor: nf.fornecedor, data: null, qtd: m.qtd,
         equipamento: m.nome, litros: m.litros, valorUnitario: nf.valorUnitario,
         valorTotal: arred2(m.litros * nf.valorUnitario),
       }));
@@ -7731,7 +7802,7 @@ function tamanhoImagem(src) {
   });
 }
 
-async function exportarExcel(ids, detalhado) {
+async function exportarExcel(ids) {
   const ExcelJS = await carregarExcelJS();
   const wb = new ExcelJS.Workbook();
   wb.creator = quemEsta();
@@ -7791,11 +7862,32 @@ async function exportarExcel(ids, detalhado) {
   const FMT_UNIT = '"R$" #,##0.0000';
   const FMT_LITROS = '#,##0.00 "L"';
 
+  /* ---------- Aba 0: dados da NF ---------- */
+  const wr = wb.addWorksheet('Dados da NF', { views: [{ showGridLines: false }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
+  wr.columns = [{ width: 14 }, { width: 12 }, { width: 28 }, { width: 28 }, { width: 14 }, { width: 14 }, { width: 16 }, { width: 14 }, { width: 16 }, { width: 14 }];
+  await cabecalhoPlanilha(wr, 10, 'Controle de Combustível — Dados da NF');
+  linhaTitulos(wr, 6, ['Nº NF', 'Data', 'Empresa', 'Descrição', 'Quantidade NF', 'Valor unitário', 'Valor total NF', 'Litros vinculados', 'Diferença (L)', 'Abastecimentos']);
+  let rr = 7;
+  ordenar(nfs.filter((n) => ids.includes(n.id)), 'emissao').forEach((nf) => {
+    const res = resumoNf(nf);
+    const row = wr.getRow(rr);
+    row.values = [nf.numero, formatarData(nf.emissao), nf.fornecedor, nf.descricao || '', nf.litrosNf ?? '', nf.valorUnitario,
+      nf.litrosNf != null ? { formula: `E${rr}*F${rr}`, result: res.valorNf } : '', res.litrosLancados,
+      nf.litrosNf != null ? { formula: `E${rr}-H${rr}`, result: res.diferenca } : '', res.qtd];
+    row.getCell(5).numFmt = FMT_LITROS;
+    row.getCell(6).numFmt = FMT_UNIT;
+    row.getCell(7).numFmt = FMT_MOEDA;
+    row.getCell(8).numFmt = FMT_LITROS;
+    row.getCell(9).numFmt = FMT_LITROS;
+    for (let c = 1; c <= 10; c += 1) row.getCell(c).border = borda;
+    rr += 1;
+  });
+
   /* ---------- Aba 1: relatorio por NF (equipamento) ---------- */
-  const ws = wb.addWorksheet('Relatório por NF', { views: [{ showGridLines: false }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
+  const ws = wb.addWorksheet('Por equipamento', { views: [{ showGridLines: false }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
   ws.columns = [{ width: 14 }, { width: 12 }, { width: 28 }, { width: 42 }, { width: 14 }, { width: 14 }, { width: 16 }];
-  await cabecalhoPlanilha(ws, 7, 'Controle de Óleo Diesel — Relatório por NF');
-  linhaTitulos(ws, 6, ['Nº NF', 'Emissão', 'Fornecedor', 'Equipamento', 'Litros', 'Valor unitário', 'Valor total']);
+  await cabecalhoPlanilha(ws, 7, 'Controle de Combustível — Litros por equipamento');
+  linhaTitulos(ws, 6, ['Nº NF', 'Data', 'Empresa', 'Equipamento', 'Litros', 'Valor unitário', 'Valor total']);
   let r = 7;
   const subtotais = [];
   ordenar(nfs.filter((n) => ids.includes(n.id)), 'emissao').forEach((nf) => {
@@ -7838,7 +7930,7 @@ async function exportarExcel(ids, detalhado) {
   /* ---------- Aba 2: abastecimentos (detalhe) ---------- */
   const wd = wb.addWorksheet('Abastecimentos', { views: [{ showGridLines: false }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
   wd.columns = [{ width: 14 }, { width: 12 }, { width: 42 }, { width: 12 }, { width: 14 }, { width: 30 }, { width: 22 }, { width: 14 }, { width: 16 }];
-  await cabecalhoPlanilha(wd, 9, 'Controle de Óleo Diesel — Abastecimentos por NF');
+  await cabecalhoPlanilha(wd, 9, 'Controle de Combustível — Abastecimentos da NF');
   linhaTitulos(wd, 6, ['Nº NF', 'Data', 'Equipamento', 'Litros', 'Horímetro / km', 'Observação', 'Lançado por', 'Valor unitário', 'Valor total']);
   let d = 7;
   ordenar(nfs.filter((n) => ids.includes(n.id)), 'emissao').forEach((nf) => {
@@ -7864,7 +7956,7 @@ async function exportarExcel(ids, detalhado) {
 
   const buffer = await wb.xlsx.writeBuffer();
   const nomes = ordenar(nfs.filter((n) => ids.includes(n.id)), 'emissao').map((n) => n.numero);
-  const nome = `Diesel_NF_${nomes.length > 3 ? `${nomes[0]}_a_${nomes[nomes.length - 1]}` : nomes.join('_')}`.replace(/[^\w.-]+/g, '-');
+  const nome = `Combustivel_NF_${nomes.length > 3 ? `${nomes[0]}_a_${nomes[nomes.length - 1]}` : nomes.join('_')}`.replace(/[^\w.-]+/g, '-');
   const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
   const link = h('a', { href: url, download: `${nome}.xlsx` });
   document.body.append(link);
@@ -7874,101 +7966,9 @@ async function exportarExcel(ids, detalhado) {
   return `${nome}.xlsx`;
 }
 
-function paginaRelatorio() {
-  if (!nfs.length) {
-    return [alertaFicticio(), criarAlerta({ tipo: 'info', titulo: 'Nenhuma NF vinculada', mensagem: 'Vincule uma NF em "Vincular NF" para extrair o relatório.' })];
-  }
-  const recente = ordenar([...nfs], 'emissao', 'desc')[0];
-  if (!nfsSelecionadas || !nfsSelecionadas.some((id) => nfPorId(id))) nfsSelecionadas = [recente.id];
-  let detalhado = false;
-
-  const area = h('div', { class: 'ctc-stack' });
-
-  function desenhar() {
-    const ids = nfsSelecionadas.filter((id) => nfPorId(id));
-    const linhas = montarRelatorio(ids, detalhado);
-    const sel = ids.map((id) => resumoNf(nfPorId(id)));
-    const litros = somar(linhas, 'litros');
-    const total = arred2(somar(linhas, 'valorTotal'));
-    const divergentes = sel.filter((s) => s.diferenca);
-
-    const colunas = [
-      { campo: 'nf', titulo: 'Nº NF' },
-      { campo: 'emissao', titulo: 'Emissão', tipo: 'data' },
-      { campo: 'fornecedor', titulo: 'Fornecedor' },
-      detalhado ? { campo: 'data', titulo: 'Data abast.', tipo: 'data' } : null,
-      { campo: 'equipamento', titulo: 'Equipamento' },
-      { campo: 'litros', titulo: 'Litros', tipo: 'numero', casas: 2, total: 'soma' },
-      { campo: 'valorUnitario', titulo: 'Valor unitário', formatar: (v) => fmtUnit(v) },
-      { campo: 'valorTotal', titulo: 'Valor total', tipo: 'moeda', total: 'soma' },
-    ].filter(Boolean);
-
-    const tabela = criarTabela({ dados: linhas, colunas, porPagina: 0, compacta: true, grade: true, altura: 'auto', rotuloTotal: 'Total geral' });
-
-    area.replaceChildren(
-      criarPainel({
-        titulo: 'Controle de Óleo Diesel — Relatório por NF', icone: 'relatorio', tema: 1,
-        tag: baseDemonstrativa ? 'Fictício' : null,
-        conteudo: h('div', { class: 'ctc-stack' },
-          h('div', { class: 'ctc-cluster' },
-            h('div', { class: 'ctc-header__logo' }, conteudoLogo(identidade.logo || MARCA.logo)),
-            h('div', {},
-              h('strong', {}, [identidade.titulo, identidade.subtitulo].filter(Boolean).join(' — ')),
-              h('div', {}, `NF: ${sel.map((s) => s.numero).join(', ')} · emitido em ${formatarData(new Date(), 'data-hora')}`))),
-          h('div', { class: 'ctc-grid ctc-grid--4' },
-            criarKpi({ rotulo: 'Notas fiscais', valor: sel.length, formato: 'numero' }).elemento,
-            criarKpi({ rotulo: 'Litros', valor: fmtLitros(litros) }).elemento,
-            criarKpi({ rotulo: 'Valor unitário', valor: [...new Set(sel.map((s) => fmtUnit(s.valorUnitario)))].join(' / ') }).elemento,
-            criarKpi({ rotulo: 'Valor total', valor: formatarMoeda(total), variante: 'accent', tema: 1 }).elemento),
-          divergentes.length ? criarAlerta({
-            tipo: 'warning', titulo: 'Diferença de litros',
-            mensagem: divergentes.map((s) => `NF ${s.numero}: NF ${fmtLitros(s.litrosNf)} × lançado ${fmtLitros(s.litrosLancados)} (${s.diferenca > 0 ? '+' : ''}${formatarNumero(s.diferenca)} L)`).join(' · '),
-          }) : null,
-          tabela.elemento),
-      }).elemento,
-    );
-  }
-
-  const escolha = criarSelecaoMultipla({
-    rotulo: 'Notas fiscais',
-    opcoes: ordenar([...nfs], 'emissao', 'desc').map((n) => ({ valor: n.id, texto: `NF ${n.numero} · ${formatarData(n.emissao)} · ${n.fornecedor}` })),
-    selecionados: nfsSelecionadas,
-    onMudar: (lista) => { nfsSelecionadas = lista.map(Number); if (nfsSelecionadas.length) desenhar(); },
-  });
-  const detalhe = criarLinhaInterruptor({ texto: 'Detalhar por abastecimento', ligado: false, onMudar: (on) => { detalhado = on; desenhar(); } });
-
-  const botaoExcel = criarBotao({ texto: 'Extrair Excel', icone: 'excel', variante: 'success' });
-  botaoExcel.addEventListener('click', () => {
-    if (!nfsSelecionadas.length) { toast.aviso('Escolha ao menos uma NF'); return; }
-    comCarregamento(botaoExcel, async () => {
-      try {
-        const nome = await exportarExcel(nfsSelecionadas, detalhado);
-        toast.sucesso('Excel gerado', nome);
-      } catch (erro) {
-        toast.erro('Não foi possível gerar o Excel', erro.message);
-      }
-    });
-  });
-
-  desenhar();
-  return [
-    alertaFicticio(),
-    criarPainel({
-      titulo: 'Escolha das NFs', icone: 'filtro',
-      conteudo: h('div', { class: 'ctc-cluster' },
-        escolha.elemento,
-        detalhe.elemento,
-        h('span', { class: 'ctc-spacer' }),
-        criarBotao({ texto: 'Imprimir / PDF', icone: 'documento', variante: 'outline', onClick: () => window.print() }),
-        botaoExcel),
-    }).elemento,
-    area,
-  ];
-}
-
 
 /* =============================================================================
-   08. PAGINA: MAQUINAS (cadastro)
+   08. CADASTRO DE EQUIPAMENTOS (janela)
    ========================================================================== */
 
 function abrirModalMaquina(maquina = null) {
@@ -7990,13 +7990,13 @@ function abrirModalMaquina(maquina = null) {
       if (editando) Object.assign(maquina, dados);
       else maquinas.push({ id: proximoIdDe(maquinas), ...dados });
       sessao.marcarAlteracao();
-      toast.sucesso(editando ? 'Máquina atualizada' : 'Máquina cadastrada', `${dados.codigo} · ${dados.descricao}`);
+      toast.sucesso(editando ? 'Equipamento atualizado' : 'Equipamento cadastrado', `${dados.codigo} · ${dados.descricao}`);
       modal.fechar();
       atualizarPagina();
     },
   });
   const modal = criarModal({
-    titulo: editando ? `Editar ${maquina.codigo}` : 'Nova máquina', tamanho: 'md', destruirAoFechar: true,
+    titulo: editando ? `Editar ${maquina.codigo}` : 'Cadastrar equipamento', tamanho: 'md', destruirAoFechar: true,
     conteudo: formulario.elemento,
     acoes: [
       { texto: 'Cancelar', variante: 'outline' },
@@ -8008,48 +8008,15 @@ function abrirModalMaquina(maquina = null) {
 
 async function excluirMaquina(maquina) {
   if (abastecimentos.some((a) => a.maquinaId === maquina.id)) {
-    toast.aviso('Máquina com abastecimentos', 'Ela não pode ser excluída. Marque como inativa para tirá-la da lista de lançamento.');
+    toast.aviso('Equipamento com abastecimentos', 'Ele não pode ser excluído. Marque como inativo para tirá-lo da lista de lançamento.');
     return;
   }
   const ok = await confirmar({ titulo: `Excluir ${maquina.codigo}?`, mensagem: maquina.descricao, textoConfirmar: 'Excluir', perigo: true });
   if (!ok) return;
   maquinas.splice(maquinas.indexOf(maquina), 1);
   sessao.marcarAlteracao();
-  toast.aviso('Máquina excluída', maquina.codigo);
+  toast.aviso('Equipamento excluído', maquina.codigo);
   atualizarPagina();
-}
-
-function paginaMaquinas() {
-  const linhas = maquinas.map((m) => {
-    const lista = abastecimentos.filter((a) => a.maquinaId === m.id);
-    return { ...m, situacao: m.ativa !== false ? 'Ativa' : 'Inativa', qtd: lista.length, litros: somar(lista, 'litros'), ref: m };
-  });
-  const tabela = criarTabela({
-    dados: linhas,
-    porPagina: 0,
-    listrada: true,
-    altura: 'auto',
-    ordenacao: { campo: 'codigo', direcao: 'asc' },
-    vazio: { titulo: 'Nenhuma máquina cadastrada', mensagem: 'Use "Nova máquina" para cadastrar.' },
-    colunas: [
-      { campo: 'codigo', titulo: 'Código', fixa: true },
-      { campo: 'descricao', titulo: 'Descrição' },
-      { campo: 'tipo', titulo: 'Tipo' },
-      { campo: 'situacao', titulo: 'Situação', render: (v) => criarBadge({ texto: v, variante: v === 'Ativa' ? 'success' : 'neutral' }) },
-      { campo: 'qtd', titulo: 'Abastecimentos', tipo: 'numero', total: 'soma' },
-      { campo: 'litros', titulo: 'Litros', tipo: 'numero', total: 'soma' },
-      {
-        campo: 'acoes', titulo: '', ordenavel: false, classe: 'ctc-col--actions',
-        render: (_, l) => h('div', { class: 'ctc-btn-group' },
-          criarBotao({ icone: 'editar', variante: 'ghost', tamanho: 'sm', titulo: 'Editar', apenasEdicao: true, onClick: () => abrirModalMaquina(l.ref) }),
-          criarBotao({ icone: 'lixeira', variante: 'ghost', tamanho: 'sm', titulo: 'Excluir', apenasEdicao: true, onClick: () => excluirMaquina(l.ref) })),
-      },
-    ],
-  });
-  return [
-    alertaFicticio(),
-    criarPainel({ titulo: 'Máquinas e equipamentos', icone: 'caixa', semEspaco: true, conteudo: tabela.elemento }).elemento,
-  ];
 }
 
 
@@ -8059,21 +8026,23 @@ function paginaMaquinas() {
 
 function abrirAjuda() {
   criarModal({
-    titulo: 'Como usar o Controle de Óleo Diesel',
+    titulo: 'Como usar o Controle de Combustível',
     destruirAoFechar: true,
     conteudo: [
       h('ol', {},
-        h('li', {}, 'Cadastros > Máquinas: cadastre os equipamentos (código e descrição).'),
-        h('li', {}, 'Abastecimentos: o almoxarifado lança data, máquina e litros de cada abastecimento.'),
-        h('li', {}, 'Vincular NF: quando chegar a NF do fornecedor, filtre o período, marque os abastecimentos e informe nº da NF, emissão, fornecedor, valor unitário e litros da NF.'),
-        h('li', {}, 'Relatório por NF: escolha a(s) NF(s) e extraia em Excel ou imprima / salve em PDF.')),
+        h('li', {}, 'Cadastrar equipamento: cadastre todos os equipamentos da obra (código e descrição).'),
+        h('li', {}, 'Lançar abastecimento: a cada abastecimento, informe a data, o equipamento e os litros.'),
+        h('li', {}, 'Vincular NF: quando chegar a NF, informe nº, data, empresa, descrição, quantidade (L) e valor unitário (o valor total é calculado). Embaixo, ligue os abastecimentos que entram nesta NF.'),
+        h('li', {}, 'Relatório: Menu > Controlador > aba Relatórios, escolha a NF e clique em Extrair relatório (Excel).')),
       criarAlerta({
         tipo: 'info', titulo: 'Perfis de acesso',
         mensagem: 'Administrador cadastra os controladores. Controlador lança e vincula NF. Visualizador apenas consulta. Cada lançamento registra quem fez.',
       }),
       criarAlerta({
         tipo: 'warning', titulo: 'Como salvar',
-        mensagem: 'As alterações ficam na tela até usar Controlador > Ferramentas > Salvar na nuvem (ou Salvar na base existente). Quem abrir depois precisa abrir a versão mais recente.',
+        mensagem: modoPortal
+          ? 'Pelo Portal KZ: as alterações ficam na sua tela até clicar em "Salvar na obra". Use "Atualizar" para ver o que a equipe salvou.'
+          : 'As alterações ficam na tela até usar Menu > Controlador > Ferramentas > Salvar na nuvem (ou Exportar JSON).',
       }),
       baseDemonstrativa ? criarAlerta({ tipo: 'info', mensagem: AVISO_FICTICIO }) : null,
     ],
@@ -8088,7 +8057,7 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
   identidade = { ...IDENTIDADE_PADRAO, ...(base.identidade || {}) };
   sessao.iniciar({ perfil, usuario, base, nomeArquivo });
   carregarDados(base);
-  nfsSelecionadas = null;
+  abaAtiva = 'abastecimentos';
   const subtituloCabecalho = () => identidade.subtitulo || '';
   const desligarProtecao = protegerSaida(sessao);
 
@@ -8141,6 +8110,7 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
         },
       }),
       onSair: sair,
+      abasExtras: [{ id: 'relatorios', texto: 'Relatórios', conteudo: abaRelatorios }],
     }),
   });
 
@@ -8153,52 +8123,36 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
         { texto: 'Ajuda', icone: 'info', variante: 'outline', onClick: abrirAjuda },
         modoPortal ? { texto: 'Atualizar', icone: 'sinc', variante: 'outline', titulo: 'Buscar o que a equipe salvou na obra', onClick: atualizarDaObra } : null,
         modoPortal ? { texto: 'Salvar na obra', icone: 'salvar', variante: 'primary', apenasEdicao: true, onClick: salvarNaObra } : null,
-        botaoControlador,
       ].filter(Boolean),
     },
     menu: {
       secoes: [
         {
           titulo: 'Principal',
-          itens: [
-            { id: 'painel', texto: 'Painel', icone: 'barras' },
-            { id: 'abastecimentos', texto: 'Abastecimentos', icone: 'tabela' },
-            {
-              id: 'grupo-nf', texto: 'Notas fiscais', icone: 'documento',
-              itens: [
-                { id: 'vincular', texto: 'Vincular NF' },
-                { id: 'notas', texto: 'NFs vinculadas' },
-                { id: 'relatorio', texto: 'Relatório por NF' },
-              ],
-            },
-            {
-              id: 'grupo-cadastros', texto: 'Cadastros', icone: 'caixa',
-              itens: [{ id: 'maquinas', texto: 'Máquinas' }],
-            },
-          ],
+          itens: [{ id: 'controle', texto: 'Controle de combustível', icone: 'tabela' }],
+        },
+        {
+          titulo: 'Ferramentas',
+          itens: [{ id: 'controlador', texto: 'Controlador', icone: 'configuracao' }],
         },
       ],
-      rodape: 'Controle de Óleo Diesel v1.1.1 · CTC App Standard v1.8',
+      /* "Controlador" saiu do cabecalho: abre o painel (Ferramentas, Sessao, Relatorios) */
+      onNavegar: (id) => { if (id === 'controlador') { appAtual?.alternarMenu(false); botaoControlador.click(); } },
+      rodape: 'Controle de Combustível v1.2 · CTC App Standard v1.8',
     },
     paginas: {
-      painel: { titulo: 'Painel', caminho: ['Principal'], render: paginaPainel },
-      abastecimentos: {
-        titulo: 'Abastecimentos',
+      controle: {
+        titulo: 'Controle de combustível',
         caminho: ['Principal'],
-        acoes: [{ texto: 'Novo abastecimento', icone: 'mais', variante: 'primary', apenasEdicao: true, onClick: () => abrirModalAbastecimento() }],
-        render: paginaAbastecimentos,
-      },
-      vincular: { titulo: 'Vincular NF', caminho: ['Notas fiscais'], render: paginaVincular },
-      notas: { titulo: 'NFs vinculadas', caminho: ['Notas fiscais'], render: paginaNotas },
-      relatorio: { titulo: 'Relatório por NF', caminho: ['Notas fiscais'], render: paginaRelatorio },
-      maquinas: {
-        titulo: 'Máquinas',
-        caminho: ['Cadastros'],
-        acoes: [{ texto: 'Nova máquina', icone: 'mais', variante: 'primary', apenasEdicao: true, onClick: () => abrirModalMaquina() }],
-        render: paginaMaquinas,
+        acoes: [
+          { texto: 'Cadastrar equipamento', icone: 'caixa', variante: 'outline', apenasEdicao: true, onClick: () => abrirModalMaquina() },
+          { texto: 'Lançar abastecimento', icone: 'mais', variante: 'outline', apenasEdicao: true, onClick: () => abrirModalAbastecimento() },
+          { texto: 'Vincular NF', icone: 'documento', variante: 'primary', apenasEdicao: true, onClick: () => abrirVincularNf() },
+        ],
+        render: paginaControle,
       },
     },
-    paginaInicial: 'painel',
+    paginaInicial: 'controle',
     somenteLeitura: perfil === 'visualizador',
     onSair: sairDoMenu,
   });
@@ -8230,7 +8184,7 @@ const telaEntrada = criarTelaEntrada({
   /* base em branco do botao "Iniciar controle": mesma estrutura, sem nenhum registro */
   criarBaseNova: () => ({ ...criarBaseVazia(FORMATO_BASE), dados: { maquinas: [], abastecimentos: [], nfs: [] } }),
   textoBaseInicial: 'Nenhuma base importada: será usada a base de demonstração com dados fictícios.',
-  rodape: 'Controle de Óleo Diesel v1.1.1 — acesso pelo login do Portal KZ (ou pela base importada).',
+  rodape: 'Controle de Óleo Diesel v1.2 — acesso pelo login do Portal KZ (ou pela base importada).',
   onEntrar: abrirAplicativo,
 });
 telaEntrada.mostrar();
