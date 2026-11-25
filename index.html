@@ -6600,7 +6600,7 @@ function mostrarCarregamento(tipo, sub = '', { logo, rodape = '', titulo, etapas
 /* ===== app.js ===== */
 /* =============================================================================
    Controle de Óleo Diesel — app.js
-   Versao: 1.0.0
+   Versao: 1.1.1 (login do Portal KZ, base da obra na nuvem KZ, Iniciar/Entrar pelo Portal)
    Feito a partir do CTC App Base (CTC App Standard v1.8.0).
 
    FLUXO
@@ -6667,6 +6667,422 @@ const armazenamento = criarArmazenamentoNuvem({
 /** Logo, titulo e subtitulo do cabecalho; gravados na base em "identidade". */
 const IDENTIDADE_PADRAO = { logo: null, titulo: 'Controle de Óleo Diesel', subtitulo: '' };
 let identidade = { ...IDENTIDADE_PADRAO };
+
+
+/* =============================================================================
+   00b. LOGIN DO PORTAL KZ (v1.1)
+   Mesmo Firebase do Portal KZ: quem ja entrou no Portal e reconhecido aqui.
+   O papel da pessoa neste controle, na obra (definido pelo gestor no Portal), libera:
+     Leitor -> Visualizador | Editor -> + Controlador | Admin/gestor -> + Administrador.
+   Com o login, os dados ficam na obra: obras/{obra}/{controle}/principal (uma base por obra,
+   compartilhada por todos), gravada pelo botao "Salvar na obra".
+   Sem o login (arquivo aberto do computador), vale o acesso antigo da tela de entrada.
+   ========================================================================== */
+
+const FIREBASE_KZ = {
+  apiKey: 'AIzaSyCk1hdv3h8A2gDOcaZDRuRtceDiG2bvXOc',
+  authDomain: 'kz-planejamento-e-custos.firebaseapp.com',
+  projectId: 'kz-planejamento-e-custos',
+  storageBucket: 'kz-planejamento-e-custos.firebasestorage.app',
+  messagingSenderId: '755715307647',
+  appId: '1:755715307647:web:6573d0437b23b880bae74a',
+};
+const NOME_CONTROLE_KZ = 'Controle de Combustível';
+const CONTROLE_KZ_PADRAO = 'combustivel';               // codigo do controle no catalogo do Portal
+const LINK_CONTROLE_KZ = 'controle-de-combustivel';     // trecho do link do controle cadastrado no Portal
+const ID_BASE_OBRA = 'principal';
+const NOME_PAPEL_KZ = { leitor: 'Leitor', editor: 'Editor', admin: 'Admin' };
+
+const KZ = (() => {
+  let pronto = null;
+
+  function traduzir(erro) {
+    const c = (erro && (erro.code || erro.message)) || String(erro);
+    if (/invalid-credential|wrong-password|user-not-found|invalid-email/.test(c)) return 'E-mail ou senha incorretos.';
+    if (/too-many-requests/.test(c)) return 'Muitas tentativas. Aguarde alguns minutos ou redefina a senha.';
+    if (/network-request-failed|unavailable/.test(c)) return 'Sem conexão com a internet.';
+    if (/user-disabled/.test(c)) return 'Usuário desativado. Fale com o gestor.';
+    if (/permission/i.test(c)) return 'Você não tem permissão para esta ação no Portal KZ.';
+    if (/importing|dynamically imported module|Failed to load module|Failed to fetch/i.test(c)) return 'Não foi possível carregar o Firebase. Verifique a internet.';
+    return c;
+  }
+
+  /** App padrao do Firebase com a config da KZ: o login fica compartilhado com o Portal. */
+  function iniciar() {
+    if (!pronto) {
+      pronto = (async () => {
+        const endereco = `https://www.gstatic.com/firebasejs/${VERSAO_SDK_FIREBASE}`;
+        const [moduloApp, fa, fs] = await Promise.all([
+          import(`${endereco}/firebase-app.js`),
+          import(`${endereco}/firebase-auth.js`),
+          import(`${endereco}/firebase-firestore.js`),
+        ]);
+        const padrao = moduloApp.getApps().find((a) => a.name === '[DEFAULT]');
+        const app = !padrao ? moduloApp.initializeApp(FIREBASE_KZ)
+          : (padrao.options.projectId === FIREBASE_KZ.projectId ? padrao
+            : (moduloApp.getApps().find((a) => a.name === 'kz-portal') || moduloApp.initializeApp(FIREBASE_KZ, 'kz-portal')));
+        return { auth: fa.getAuth(app), db: fs.getFirestore(app), fa, fs };
+      })().catch((erro) => { pronto = null; throw new Error(traduzir(erro)); });
+    }
+    return pronto;
+  }
+
+  async function executar(operacao) {
+    try { return await operacao(await iniciar()); } catch (erro) { throw new Error(traduzir(erro)); }
+  }
+
+  const usuarioAtual = () => executar(({ auth, fa }) => new Promise((resolver) => {
+    const parar = fa.onAuthStateChanged(auth, (u) => { parar(); resolver(u && !u.isAnonymous ? u : null); });
+  }));
+  const entrar = (email, senha) => executar(({ auth, fa }) => fa.signInWithEmailAndPassword(auth, String(email).trim(), senha));
+  const redefinirSenha = (email) => executar(({ auth, fa }) => fa.sendPasswordResetEmail(auth, String(email).trim()));
+
+  /** Obra: vem do Portal (?obra=wsf3) ou da ultima obra escolhida no Portal (mesmo site). */
+  function obraDaUrl() {
+    let o = new URLSearchParams(window.location.search).get('obra');
+    if (!o) { try { o = localStorage.getItem('kz-portal-obra'); } catch (erro) { o = null; } }
+    return String(o || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
+  }
+
+  function papelNoControle(membro, controle) {
+    if (!membro) return '';
+    if (membro.gestor) return 'admin';
+    const papeis = membro.papeis || {};
+    const papel = papeis[controle] || papeis['*'] || '';
+    return NOME_PAPEL_KZ[papel] ? papel : '';
+  }
+
+  /** Codigo deste controle na obra: o controle cadastrado no Portal cujo link aponta para este app. */
+  function codigoNaObra(obra) {
+    const controles = (obra && obra.controles) || {};
+    const porLink = Object.keys(controles).find((k) => String((controles[k] || {}).url || '').toLowerCase().includes(LINK_CONTROLE_KZ));
+    return porLink || CONTROLE_KZ_PADRAO;
+  }
+
+  const acessoNaObra = (obra) => executar(async ({ auth, db, fs }) => {
+    const u = auth.currentUser;
+    const [gg, m, o, cadastro] = await Promise.all([
+      fs.getDoc(fs.doc(db, 'gestores_gerais', u.uid)),
+      fs.getDoc(fs.doc(db, 'obras', obra, 'membros', u.uid)),
+      fs.getDoc(fs.doc(db, 'obras', obra)),
+      fs.getDoc(fs.doc(db, 'usuarios', u.uid)),
+    ]);
+    const nome = (cadastro.exists() && cadastro.data().nome) || u.displayName || u.email;
+    if (!o.exists()) return { papel: '', gestor: false, controle: CONTROLE_KZ_PADRAO, obra: null, nome };
+    const dadosObra = { id: obra, ...o.data() };
+    const controle = codigoNaObra(dadosObra);
+    const papel = gg.exists() ? 'admin' : (m.exists() ? papelNoControle(m.data(), controle) : '');
+    const gestor = gg.exists() || Boolean(m.exists() && m.data().gestor);
+    return { papel, gestor, controle, obra: dadosObra, nome };
+  });
+
+  const obrasComAcesso = () => executar(async ({ auth, db, fs }) => {
+    const u = auth.currentUser;
+    const [gg, obras] = await Promise.all([fs.getDoc(fs.doc(db, 'gestores_gerais', u.uid)), fs.getDocs(fs.collection(db, 'obras'))]);
+    const lista = await Promise.all(obras.docs.map(async (d) => {
+      const o = { id: d.id, ...d.data() };
+      if (o.situacao === 'encerrada' && !gg.exists()) return null;
+      let papel = gg.exists() ? 'admin' : '';
+      if (!papel) {
+        const m = await fs.getDoc(fs.doc(db, 'obras', d.id, 'membros', u.uid)).catch(() => null);
+        if (m && m.exists()) papel = papelNoControle(m.data(), codigoNaObra(o));
+      }
+      return papel ? { id: o.id, nome: o.nome, sigla: o.sigla, papel } : null;
+    }));
+    return lista.filter(Boolean).sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt-BR'));
+  });
+
+  /** Divide o texto em pacotes de ate ~900 KB (o Firestore aceita no maximo 1 MB por documento). */
+  function dividirEmPacotes(texto, maxBytes = 900000) {
+    const cod = new TextEncoder();
+    const pacotes = [];
+    let i = 0;
+    while (i < texto.length) {
+      let fim = Math.min(texto.length, i + maxBytes);
+      while (cod.encode(texto.slice(i, fim)).length > maxBytes) fim = i + Math.floor((fim - i) * 0.9);
+      const c = texto.charCodeAt(fim - 1);
+      if (fim < texto.length && c >= 0xd800 && c <= 0xdbff) fim -= 1;
+      pacotes.push(texto.slice(i, fim));
+      i = fim;
+    }
+    return pacotes.length ? pacotes : [''];
+  }
+
+  /**
+   * Base unica da obra:
+   *   obras/{obra}/{controle}/principal                          -> { salvoEm, autor, tamanho, pacotes, slot }
+   *   obras/{obra}/{controle}_conteudo/principal/pacotes/{slot}000.. -> { texto }
+   * Grava no slot que nao esta em uso e so no fim troca o apontador: se a internet cair
+   * no meio, a versao anterior segue inteira.
+   */
+  function criarNuvemObra({ obra, controle }) {
+    const refMeta = (db, fs) => fs.doc(db, 'obras', obra, controle, ID_BASE_OBRA);
+    const refPacote = (db, fs, slot, i) => fs.doc(db, 'obras', obra, `${controle}_conteudo`, ID_BASE_OBRA, 'pacotes', `${slot}${String(i).padStart(3, '0')}`);
+    const meta = () => executar(async ({ db, fs }) => {
+      const m = await fs.getDoc(refMeta(db, fs));
+      return m.exists() ? m.data() : null;
+    });
+    return {
+      meta,
+      ler: () => executar(async ({ db, fs }) => {
+        const m = await fs.getDoc(refMeta(db, fs));
+        if (!m.exists()) return null;
+        const d = m.data();
+        const partes = await Promise.all(Array.from({ length: d.pacotes || 0 }, (_, i) => fs.getDoc(refPacote(db, fs, d.slot, i))));
+        if (partes.some((p) => !p.exists())) throw new Error('Base da obra incompleta na nuvem (faltam pacotes).');
+        const texto = partes.map((p) => p.data().texto).join('');
+        if (d.tamanho && texto.length !== d.tamanho) throw new Error('Base da obra incompleta na nuvem (tamanho não confere).');
+        return { meta: d, base: JSON.parse(texto) };
+      }),
+      gravar: (base, autor) => executar(async ({ db, fs }) => {
+        const atual = await fs.getDoc(refMeta(db, fs));
+        const slot = atual.exists() && atual.data().slot === 'a' ? 'b' : 'a';
+        const texto = JSON.stringify(base);
+        const pacotes = dividirEmPacotes(texto);
+        for (let i = 0; i < pacotes.length; i += 5) {
+          const lote = fs.writeBatch(db);
+          pacotes.slice(i, i + 5).forEach((t, j) => lote.set(refPacote(db, fs, slot, i + j), { texto: t }));
+          await lote.commit();
+        }
+        const novo = { salvoEm: new Date().toISOString(), autor: autor || '', tamanho: texto.length, pacotes: pacotes.length, slot };
+        await fs.setDoc(refMeta(db, fs), novo);
+        return novo;
+      }),
+    };
+  }
+
+  return { usuarioAtual, entrar, redefinirSenha, obraDaUrl, acessoNaObra, obrasComAcesso, criarNuvemObra };
+})();
+
+let obraNuvem = KZ.obraDaUrl();
+let usuarioKZ = null;          // { email, nome, papel, gestor, sigla, obra, controle }
+let nuvemObra = null;
+let modoPortal = false;        // aplicativo aberto pelo login do Portal
+let salvoEmCarregado = null;   // salvoEm da base da obra quando foi aberta (para avisar se outra pessoa salvou)
+
+function pedirLoginKZ() {
+  return new Promise((resolver) => {
+    let usuario = null;
+    const formulario = criarFormulario({
+      colunas: 1,
+      semBotoes: true,
+      campos: [
+        { nome: 'email', rotulo: 'E-mail', tipo: 'email', obrigatorio: true, atributos: { autocomplete: 'username' } },
+        { nome: 'senha', rotulo: 'Senha', tipo: 'senha', obrigatorio: true, atributos: { autocomplete: 'current-password' } },
+      ],
+      onEnviar: async ({ email, senha }) => {
+        try {
+          const r = await KZ.entrar(email, senha);
+          usuario = r && r.user ? r.user : await KZ.usuarioAtual();
+          modal.fechar();
+        } catch (erro) {
+          formulario.definirErro('senha', erro.message);
+        }
+      },
+    });
+    const esqueci = async () => {
+      const { email } = formulario.obterValores();
+      if (!email) { formulario.definirErro('email', 'Digite o seu e-mail para receber o link.'); return; }
+      try { await KZ.redefinirSenha(email); } catch (erro) { /* nao revela se o e-mail existe */ }
+      toast.info('Redefinição de senha', `Se ${email} tiver acesso ao Portal KZ, chegará um e-mail com o link (olhe também o spam).`);
+    };
+    const modal = criarModal({
+      titulo: 'Entrar — login do Portal KZ',
+      tamanho: 'sm',
+      destruirAoFechar: true,
+      conteudo: [h('p', { class: 'ctc-text-sm ctc-text-muted' }, `Use o mesmo e-mail e senha do Portal KZ. O seu acesso ao ${NOME_CONTROLE_KZ} (Leitor, Editor ou Admin) é o liberado pelo gestor da obra.`), formulario.elemento],
+      onFechar: () => resolver(usuario),
+      acoes: [
+        { texto: 'Esqueci a senha', variante: 'ghost', fechar: false, onClick: esqueci },
+        { texto: 'Cancelar', variante: 'outline' },
+        { texto: 'Entrar', variante: 'primary', fechar: false, onClick: () => formulario.enviar() },
+      ],
+    });
+    modal.abrir();
+  });
+}
+
+/** Modal de escolha (lista ou botao segmentado). Retorna o valor escolhido ou null. */
+function escolherOpcao({ titulo, rotulo, opcoes, valor, texto, segmentado = false }) {
+  return new Promise((resolver) => {
+    let resposta = null;
+    let atual = valor ?? opcoes[0].valor;
+    const seletor = segmentado
+      ? criarSegmentado({ rotulo, opcoes, valor: atual, onMudar: (v) => { atual = v; } })
+      : null;
+    const formulario = segmentado ? null : criarFormulario({
+      colunas: 1, semBotoes: true, valores: { opcao: atual },
+      campos: [{ nome: 'opcao', rotulo, tipo: 'select', obrigatorio: true, opcoes }],
+      onEnviar: ({ opcao }) => { resposta = opcao; modal.fechar(); },
+    });
+    const modal = criarModal({
+      titulo, tamanho: 'sm', destruirAoFechar: true,
+      conteudo: [texto ? h('p', { class: 'ctc-text-sm ctc-text-muted' }, texto) : null, segmentado ? seletor.elemento : formulario.elemento],
+      onFechar: () => resolver(resposta),
+      acoes: [
+        { texto: 'Cancelar', variante: 'outline' },
+        {
+          texto: 'Continuar', variante: 'primary', fechar: false,
+          onClick: () => { if (segmentado) { resposta = atual; modal.fechar(); } else formulario.enviar(); },
+        },
+      ],
+    });
+    modal.abrir();
+  });
+}
+
+async function escolherObraKZ() {
+  const lista = await KZ.obrasComAcesso();
+  if (!lista.length) throw new Error(`Seu login não tem acesso ao ${NOME_CONTROLE_KZ} em nenhuma obra. Fale com o gestor da obra.`);
+  if (lista.length === 1) return lista[0].id;
+  return escolherOpcao({
+    titulo: 'Qual obra?', rotulo: 'Obra',
+    opcoes: lista.map((o) => ({ valor: o.id, texto: `${o.sigla ? `${o.sigla} — ` : ''}${o.nome || o.id}` })),
+  });
+}
+
+let garantindoKZ = null;
+/** Confere o login do Portal, a obra e o papel neste controle (pede o login se pedirLogin). */
+function garantirLoginKZ({ pedirLogin = true } = {}) {
+  if (usuarioKZ) return Promise.resolve(usuarioKZ);
+  if (!garantindoKZ) {
+    garantindoKZ = (async () => {
+      let user = await KZ.usuarioAtual();
+      if (!user && pedirLogin) user = await pedirLoginKZ();
+      if (!user) throw new Error('Login cancelado.');
+      if (!obraNuvem) {
+        const escolhida = await escolherObraKZ();
+        if (!escolhida) throw new Error('Nenhuma obra escolhida (cancelado).');
+        obraNuvem = escolhida;
+      }
+      const acesso = await KZ.acessoNaObra(obraNuvem);
+      if (!acesso.obra) throw new Error(`A obra "${obraNuvem}" não existe no Portal KZ. Confira o link recebido.`);
+      if (!acesso.papel) throw new Error(`Seu login (${user.email}) não tem acesso ao ${NOME_CONTROLE_KZ} na obra ${acesso.obra.sigla || obraNuvem}. Fale com o gestor da obra.`);
+      nuvemObra = KZ.criarNuvemObra({ obra: obraNuvem, controle: acesso.controle });
+      usuarioKZ = { email: user.email, nome: acesso.nome, papel: acesso.papel, gestor: acesso.gestor, sigla: acesso.obra.sigla || obraNuvem, obra: obraNuvem, controle: acesso.controle };
+      try { localStorage.setItem('kz-portal-obra', obraNuvem); } catch (erro) { /* sem armazenamento */ }
+      atualizarBlocoPortal();
+      return usuarioKZ;
+    })().finally(() => { garantindoKZ = null; });
+  }
+  return garantindoKZ;
+}
+
+/** Perfis liberados pelo papel no Portal: Leitor so consulta; Admin (ou gestor) tem tudo. */
+function perfisDoPapel({ papel, gestor }) {
+  const lista = [{ valor: 'visualizador', texto: 'Visualizador' }];
+  if (papel === 'editor' || papel === 'admin' || gestor) lista.push({ valor: 'controlador', texto: 'Controlador' });
+  if (papel === 'admin' || gestor) lista.push({ valor: 'administrador', texto: 'Administrador' });
+  return lista;
+}
+
+/** Entrada pelo login do Portal: escolhe o perfil, abre a base da obra e entra no aplicativo. */
+async function entrarPeloPortal({ perfilPreferido } = {}) {
+  try {
+    await garantirLoginKZ();
+  } catch (erro) {
+    if (!/cancelado/i.test(erro.message)) toast.aviso('Login do Portal KZ', erro.message);
+    return;
+  }
+  const opcoes = perfisDoPapel(usuarioKZ);
+  const perfil = opcoes.length === 1 ? opcoes[0].valor : await escolherOpcao({
+    titulo: `Acessar a obra ${usuarioKZ.sigla} como`, rotulo: 'Acessar como', segmentado: true,
+    opcoes, valor: (opcoes.find((o) => o.valor === perfilPreferido) || opcoes[Math.min(1, opcoes.length - 1)]).valor,
+    texto: `${usuarioKZ.nome} · ${NOME_PAPEL_KZ[usuarioKZ.papel] || usuarioKZ.papel} no ${NOME_CONTROLE_KZ}`,
+  });
+  if (!perfil) return;
+
+  const carregando = mostrarCarregamento('nuvem', `Obra ${usuarioKZ.sigla}`, { logo: MARCA.logo });
+  let lido;
+  try {
+    lido = await nuvemObra.ler();
+    if (lido && lido.base && lido.base.formato !== FORMATO_BASE) throw new Error('A base salva na obra não é deste controle.');
+    await carregando.fim(true);
+  } catch (erro) {
+    await carregando.fim(false, erro.message);
+    toast.erro('Não foi possível abrir a base da obra', erro.message);
+    return;
+  }
+  const base = lido ? lido.base : { ...criarBaseVazia(FORMATO_BASE), identidade: { ...IDENTIDADE_PADRAO, subtitulo: `Obra ${usuarioKZ.sigla}` }, dados: { maquinas: [], abastecimentos: [], nfs: [] } };
+  salvoEmCarregado = lido ? lido.meta.salvoEm : null;
+  modoPortal = true;
+  telaEntrada.remover();
+  abrirAplicativo({
+    perfil,
+    usuario: { nome: usuarioKZ.nome, login: usuarioKZ.email },
+    base,
+    nomeArquivo: `Obra ${usuarioKZ.sigla} (Portal KZ)`,
+  });
+  if (!lido) {
+    toast.info('Primeiro acesso nesta obra', perfil === 'visualizador'
+      ? 'Ainda não há dados salvos nesta obra.'
+      : 'Comece cadastrando as máquinas. Use "Salvar na obra" para gravar.');
+  }
+}
+
+/** Grava a base atual na obra (todos os que entram pelo Portal veem esta versao). */
+async function salvarNaObra() {
+  if (!modoPortal || !nuvemObra || !sessao.podeEditar()) return;
+  try {
+    const remoto = await nuvemObra.meta();
+    if (remoto && remoto.salvoEm !== salvoEmCarregado) {
+      const ok = await confirmar({
+        titulo: 'Outra pessoa salvou depois que você abriu',
+        mensagem: `${remoto.autor || 'Alguém'} salvou em ${formatarData(remoto.salvoEm, 'data-hora')}. Se salvar agora, o que essa pessoa gravou será substituído pelo que está na sua tela. `
+          + 'Para não perder nada: cancele, anote os seus lançamentos novos, use "Atualizar" e lance de novo.',
+        textoConfirmar: 'Salvar mesmo assim',
+        perigo: true,
+      });
+      if (!ok) return;
+    }
+    const base = { ...obterBaseParaSalvar(), salvoEm: new Date().toISOString() };
+    const meta = await nuvemObra.gravar(base, quemEsta());
+    salvoEmCarregado = meta.salvoEm;
+    sessao.limparAlteracoes(sessao.obter().nomeArquivo);
+    toast.sucesso('Salvo na obra', `${usuarioKZ.sigla} · ${formatarData(meta.salvoEm, 'data-hora')}`);
+  } catch (erro) {
+    toast.erro('Não foi possível salvar na obra', erro.message);
+  }
+}
+
+/** Recarrega a base da obra (o que os outros salvaram). */
+async function atualizarDaObra() {
+  if (!modoPortal || !nuvemObra) return;
+  if (sessao.obter().alteracoes && !(await confirmar({
+    titulo: 'Descartar o que não foi salvo?',
+    mensagem: 'Há alterações na sua tela que ainda não foram salvas na obra. Ao atualizar, elas serão perdidas.',
+    textoConfirmar: 'Atualizar mesmo assim',
+    perigo: true,
+  }))) return;
+  try {
+    const lido = await nuvemObra.ler();
+    if (!lido) { toast.info('Nada salvo na obra ainda'); return; }
+    const { perfil, usuario, nomeArquivo } = sessao.obter();
+    sessao.iniciar({ perfil, usuario, base: lido.base, nomeArquivo });
+    carregarDados(lido.base);
+    salvoEmCarregado = lido.meta.salvoEm;
+    atualizarPagina();
+    toast.sucesso('Dados atualizados', `Salvo por ${lido.meta.autor || '—'} em ${formatarData(lido.meta.salvoEm, 'data-hora')}`);
+  } catch (erro) {
+    toast.erro('Não foi possível atualizar', erro.message);
+  }
+}
+
+/* Bloco "Portal KZ" na tela de entrada (montado com componentes do padrao). */
+const blocoPortal = h('div', { class: 'ctc-stack' });
+function atualizarBlocoPortal() {
+  const texto = usuarioKZ
+    ? `${usuarioKZ.nome} · ${NOME_PAPEL_KZ[usuarioKZ.papel] || usuarioKZ.papel} · obra ${usuarioKZ.sigla}`
+    : 'Use o mesmo e-mail e senha do Portal KZ. Os dados ficam salvos na obra e são vistos por toda a equipe.';
+  blocoPortal.replaceChildren(
+    h('div', { class: 'ctc-landing__section-title ctc-entrada-rotulo' }, 'PORTAL KZ'),
+    h('p', { class: 'ctc-text-sm ctc-text-muted' }, texto),
+    criarBotao({
+      texto: usuarioKZ ? `Entrar na obra ${usuarioKZ.sigla}` : 'Entrar com o login do Portal KZ',
+      icone: 'usuario', variante: 'primary', bloco: true, onClick: entrarPeloPortal,
+    }),
+  );
+}
 
 
 /* =============================================================================
@@ -7680,11 +8096,14 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
   const sair = () => {
     desligarProtecao();
     const estado = sessao.obter();
-    if (!estado.alteracoes) {
+    // pelo Portal a base fica na obra: a tela inicial nao guarda uma copia dela
+    if (!estado.alteracoes && !modoPortal) {
       telaEntrada.definirBase({ ...obterBaseParaSalvar(), salvoEm: estado.ultimoSalvamento || estado.base.salvoEm || null }, estado.nomeArquivo);
     }
     app.destruir();
     appAtual = null;
+    modoPortal = false;
+    atualizarBlocoPortal();
     telaEntrada.mostrar();
   };
 
@@ -7706,7 +8125,8 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
       titulo: `Controlador — ${usuario ? usuario.nome : NOME_PERFIL[perfil]}`,
       prefixoArquivo: FORMATO_BASE,
       obterBaseParaSalvar,
-      armazenamento,
+      // pelo Portal, a gravacao e o botao "Salvar na obra" do cabecalho
+      armazenamento: modoPortal ? undefined : armazenamento,
       administrador: ADMINISTRADOR,
       onEditarCabecalho: () => abrirEditorCabecalho({
         identidade,
@@ -7731,8 +8151,10 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
       subtitulo: subtituloCabecalho(),
       acoes: [
         { texto: 'Ajuda', icone: 'info', variante: 'outline', onClick: abrirAjuda },
+        modoPortal ? { texto: 'Atualizar', icone: 'sinc', variante: 'outline', titulo: 'Buscar o que a equipe salvou na obra', onClick: atualizarDaObra } : null,
+        modoPortal ? { texto: 'Salvar na obra', icone: 'salvar', variante: 'primary', apenasEdicao: true, onClick: salvarNaObra } : null,
         botaoControlador,
-      ],
+      ].filter(Boolean),
     },
     menu: {
       secoes: [
@@ -7756,7 +8178,7 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
           ],
         },
       ],
-      rodape: 'Controle de Óleo Diesel v1.0 · CTC App Standard v1.8',
+      rodape: 'Controle de Óleo Diesel v1.1.1 · CTC App Standard v1.8',
     },
     paginas: {
       painel: { titulo: 'Painel', caminho: ['Principal'], render: paginaPainel },
@@ -7808,10 +8230,55 @@ const telaEntrada = criarTelaEntrada({
   /* base em branco do botao "Iniciar controle": mesma estrutura, sem nenhum registro */
   criarBaseNova: () => ({ ...criarBaseVazia(FORMATO_BASE), dados: { maquinas: [], abastecimentos: [], nfs: [] } }),
   textoBaseInicial: 'Nenhuma base importada: será usada a base de demonstração com dados fictícios.',
-  rodape: 'CTC App Standard v1.8 — sem servidor: os perfis controlam o uso, não substituem segurança de rede.',
+  rodape: 'Controle de Óleo Diesel v1.1.1 — acesso pelo login do Portal KZ (ou pela base importada).',
   onEntrar: abrirAplicativo,
 });
 telaEntrada.mostrar();
+
+/* v1.1: bloco "Portal KZ" na tela de entrada, acima do rodape */
+atualizarBlocoPortal();
+{
+  const cartao = telaEntrada.elemento.querySelector('.ctc-landing__card') || telaEntrada.elemento;
+  cartao.insertBefore(blocoPortal, cartao.querySelector('.ctc-landing__footer'));
+
+  /* v1.1.1: "Iniciar controle" e "Entrar" como Controlador/Administrador passam pelo login do Portal
+     (sem senha do administrador): a base da obra e criada na primeira gravacao.
+     So o Visualizador continua entrando direto (demonstracao ou base importada). */
+  const [, cartaoIniciar] = cartao.querySelectorAll('.ctc-entrada-acoes > *');
+  if (cartaoIniciar) {
+    cartaoIniciar.addEventListener('click', (evento) => {
+      evento.preventDefault();
+      evento.stopImmediatePropagation();
+      entrarPeloPortal({ perfilPreferido: 'administrador' });
+    }, true);
+    const textoSenha = [...cartaoIniciar.querySelectorAll('*')].find((el) => !el.children.length && /senha do admin/i.test(el.textContent));
+    if (textoSenha) textoSenha.textContent = 'Pelo login do Portal KZ';
+    cartaoIniciar.setAttribute('title', 'Abrir o controle da obra pelo login do Portal KZ (sem senha do administrador)');
+  }
+  const botaoEntrar = [...cartao.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Entrar');
+  if (botaoEntrar) {
+    botaoEntrar.addEventListener('click', (evento) => {
+      const marcado = cartao.querySelector('.ctc-entrada-perfis [aria-pressed="true"]');
+      const perfil = marcado ? marcado.textContent.trim().toLowerCase() : 'visualizador';
+      if (perfil === 'visualizador') return;
+      evento.preventDefault();
+      evento.stopImmediatePropagation();
+      entrarPeloPortal({ perfilPreferido: perfil });
+    }, true);
+  }
+}
+
+/* Quem ja entrou no Portal KZ (mesmo site e mesmo Firebase) e reconhecido sem digitar nada.
+   Aberto pelo link da obra (?obra=...), o login do Portal e pedido logo na entrada. */
+(async () => {
+  const pelaObra = Boolean(new URLSearchParams(window.location.search).get('obra'));
+  try {
+    await garantirLoginKZ({ pedirLogin: pelaObra });
+    if (pelaObra) entrarPeloPortal();
+  } catch (erro) {
+    if (pelaObra && !/cancelado/i.test(erro.message)) toast.aviso('Login do Portal KZ', erro.message);
+  }
+})();
 
 })();
 </script>
