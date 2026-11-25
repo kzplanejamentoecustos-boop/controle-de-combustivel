@@ -6600,7 +6600,7 @@ function mostrarCarregamento(tipo, sub = '', { logo, rodape = '', titulo, etapas
 /* ===== app.js ===== */
 /* =============================================================================
    Controle de Óleo Diesel — app.js
-   Versao: 1.2.0 (tela unica; Vincular NF com valor total; Controlador no menu com aba Relatorios)
+   Versao: 1.2.1 (entrada direta pelo papel no Portal; tela unica; Vincular NF com valor total; Controlador no menu com aba Relatorios)
    Feito a partir do CTC App Base (CTC App Standard v1.8.0).
 
    FLUXO
@@ -6977,20 +6977,17 @@ function perfisDoPapel({ papel, gestor }) {
 }
 
 /** Entrada pelo login do Portal: escolhe o perfil, abre a base da obra e entra no aplicativo. */
-async function entrarPeloPortal({ perfilPreferido } = {}) {
+async function entrarPeloPortal() {
   try {
     await garantirLoginKZ();
   } catch (erro) {
     if (!/cancelado/i.test(erro.message)) toast.aviso('Login do Portal KZ', erro.message);
     return;
   }
+  /* v1.2.1: sem janela de escolha: entra direto com o maior perfil liberado pelo papel no Portal
+     (Leitor = Visualizador, Editor = Controlador, Admin/gestor = Administrador). */
   const opcoes = perfisDoPapel(usuarioKZ);
-  const perfil = opcoes.length === 1 ? opcoes[0].valor : await escolherOpcao({
-    titulo: `Acessar a obra ${usuarioKZ.sigla} como`, rotulo: 'Acessar como', segmentado: true,
-    opcoes, valor: (opcoes.find((o) => o.valor === perfilPreferido) || opcoes[Math.min(1, opcoes.length - 1)]).valor,
-    texto: `${usuarioKZ.nome} · ${NOME_PAPEL_KZ[usuarioKZ.papel] || usuarioKZ.papel} no ${NOME_CONTROLE_KZ}`,
-  });
-  if (!perfil) return;
+  const perfil = opcoes[opcoes.length - 1].valor;
 
   const carregando = mostrarCarregamento('nuvem', `Obra ${usuarioKZ.sigla}`, { logo: MARCA.logo });
   let lido;
@@ -8138,7 +8135,7 @@ function abrirAplicativo({ perfil, usuario, base, nomeArquivo }) {
       ],
       /* "Controlador" saiu do cabecalho: abre o painel (Ferramentas, Sessao, Relatorios) */
       onNavegar: (id) => { if (id === 'controlador') { appAtual?.alternarMenu(false); botaoControlador.click(); } },
-      rodape: 'Controle de Combustível v1.2 · CTC App Standard v1.8',
+      rodape: 'Controle de Combustível v1.2.1 · CTC App Standard v1.8',
     },
     paginas: {
       controle: {
@@ -8184,7 +8181,7 @@ const telaEntrada = criarTelaEntrada({
   /* base em branco do botao "Iniciar controle": mesma estrutura, sem nenhum registro */
   criarBaseNova: () => ({ ...criarBaseVazia(FORMATO_BASE), dados: { maquinas: [], abastecimentos: [], nfs: [] } }),
   textoBaseInicial: 'Nenhuma base importada: será usada a base de demonstração com dados fictícios.',
-  rodape: 'Controle de Óleo Diesel v1.2 — acesso pelo login do Portal KZ (ou pela base importada).',
+  rodape: 'Controle de Óleo Diesel v1.2.1 — acesso pelo login do Portal KZ (ou pela base importada).',
   onEntrar: abrirAplicativo,
 });
 telaEntrada.mostrar();
@@ -8203,7 +8200,7 @@ atualizarBlocoPortal();
     cartaoIniciar.addEventListener('click', (evento) => {
       evento.preventDefault();
       evento.stopImmediatePropagation();
-      entrarPeloPortal({ perfilPreferido: 'administrador' });
+      entrarPeloPortal();
     }, true);
     const textoSenha = [...cartaoIniciar.querySelectorAll('*')].find((el) => !el.children.length && /senha do admin/i.test(el.textContent));
     if (textoSenha) textoSenha.textContent = 'Pelo login do Portal KZ';
@@ -8217,7 +8214,7 @@ atualizarBlocoPortal();
       if (perfil === 'visualizador') return;
       evento.preventDefault();
       evento.stopImmediatePropagation();
-      entrarPeloPortal({ perfilPreferido: perfil });
+      entrarPeloPortal();
     }, true);
   }
 }
